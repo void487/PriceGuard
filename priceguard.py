@@ -9,7 +9,7 @@ Hlavní vlastnosti
     • polling uvnitř DOM (žádné nekonečné reloady),
     • fallbacky čtení (inner_text → text_content → JS innerText → inner_html),
     • inteligentní sken kandidátů (meta/itemprop/JSON-LD/„price“ class/atributy) a výběr nejbližší hodnoty k baseline.
-- Tabulka: URL, Popis (editovatelné), Čekat na (volitelné, editovatelné), Baseline, Poslední, Načteno, Změna, Aktivní, Akce.
+- Tabulka: URL, Popis (editovatelné), Baseline, Poslední, Načteno, Změna, Bonus I, Bonus II, Aktivní, Akce (interní ID je skryté).
 - Dark/Light motiv s přepínačem (výchozí Automaticky) a jemné barvení řádků (sloupec Akce se NEbarví).
 - Tlačítka „Kontrola“/„Kontrola aktivních“ zobrazují běh (⏳) a jsou dočasně disable.
 - Dávka (`--batch`) posílá e-mail (poklesy + chyby). GUI maily neposílá.
@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 from dotenv import load_dotenv
 from PySide6 import QtCore, QtWidgets, QtGui
@@ -61,7 +61,13 @@ CREATE TABLE IF NOT EXISTS targets(
   baseline REAL NOT NULL,
   active INT NOT NULL DEFAULT 1,
   note TEXT,
-  created_at DATETIME NOT NULL
+  created_at DATETIME NOT NULL,
+  description TEXT,
+  timeout_ms INT,
+  bonus1_selector TEXT,
+  bonus1_text TEXT,
+  bonus2_selector TEXT,
+  bonus2_text TEXT
 );
 CREATE TABLE IF NOT EXISTS checks(
   id INTEGER PRIMARY KEY,
@@ -141,19 +147,20 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as con:
         if need_create:
             con.executescript(CREATE_SQL)
-        # Migrace: description, wait_selector, timeout_ms
+        # Migrace: description, timeout_ms, bonus columns
         try:
             con.execute("ALTER TABLE targets ADD COLUMN description TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            con.execute("ALTER TABLE targets ADD COLUMN wait_selector TEXT")
         except sqlite3.OperationalError:
             pass
         try:
             con.execute("ALTER TABLE targets ADD COLUMN timeout_ms INT")
         except sqlite3.OperationalError:
             pass
+        for col in ("bonus1_selector TEXT", "bonus1_text TEXT", "bonus2_selector TEXT", "bonus2_text TEXT"):
+            try:
+                con.execute(f"ALTER TABLE targets ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
 
 def parse_number(text: str) -> float:
     """Vytáhne první smysluplné číslo z textu (cz/en formáty) a převede na float."""
@@ -187,8 +194,11 @@ class Target:
     note: Optional[str]
     created_at: str
     description: Optional[str] = None
-    wait_selector: Optional[str] = None
     timeout_ms: Optional[int] = None
+    bonus1_selector: Optional[str] = None
+    bonus1_text: Optional[str] = None
+    bonus2_selector: Optional[str] = None
+    bonus2_text: Optional[str] = None
 
 # ---- Playwright helpers ----
 async def launch_browser_headed():
@@ -246,6 +256,30 @@ async def capture_target(url: str) -> Tuple[str, float]:
         await browser.close()
         await pw.stop()
 
+async def capture_text_snippet(url: str) -> Tuple[str, str]:
+    pw, browser, page = await launch_browser_headed()
+    try:
+        fut = asyncio.get_event_loop().create_future()
+
+        async def on_pick(selector, text_value):
+            if not fut.done():
+                fut.set_result((selector, (text_value or "").strip()))
+            return "ok"
+
+        await page.expose_function("__picked", on_pick)
+        await page.add_init_script(CSS_PATH_HELPER)
+        await page.add_init_script(HILITE_STYLE)
+        await page.add_init_script(PICKER_JS)
+
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.evaluate(PICKER_JS)
+
+        selector, text_value = await fut
+        return selector, text_value
+    finally:
+        await browser.close()
+        await pw.stop()
+
 async def _maybe_accept_cookies(page):
     sel = "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('Přijmout vše'), button:has-text('Přijmout'), button:has-text('Souhlasím')"
     try:
@@ -255,22 +289,21 @@ async def _maybe_accept_cookies(page):
     except Exception:
         pass
 
-async def fetch_value(url: str, selector: str, wait_selector: Optional[str], timeout_ms: int, baseline: Optional[float]) -> float:
-    """Jedna navigace + polling v DOM + časný sken kandidátů. Bez opakovaných reloadů."""
+async def fetch_target_data(t: Target, timeout_ms: int) -> Tuple[float, Dict[int, Optional[str]]]:
+    """Jedna navigace + polling v DOM + časný sken kandidátů a načtení bonus textů."""
     import time as _time
     pw, browser, page, close_pw = await launch_browser_headless()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.goto(t.url, wait_until="domcontentloaded", timeout=timeout_ms)
         await _maybe_accept_cookies(page)
-        if wait_selector and wait_selector.strip():
-            await page.wait_for_selector(wait_selector.strip(), timeout=timeout_ms, state="visible")
 
-        loc = page.locator(selector)
+        loc = page.locator(t.selector)
         await loc.wait_for(state="attached", timeout=timeout_ms)
 
         start = _time.monotonic()
         did_candidate_scan = False
         last_text_sample = ""
+        price_value: Optional[float] = None
 
         while (_time.monotonic() - start) * 1000 < timeout_ms:
             # Počkej, až se v elementu objeví číslice
@@ -312,12 +345,13 @@ async def fetch_value(url: str, selector: str, wait_selector: Optional[str], tim
             if txt:
                 last_text_sample = txt
                 try:
-                    return parse_number(txt)
+                    price_value = parse_number(txt)
+                    break
                 except Exception:
                     pass  # ještě zkusíme kandidáty níže
 
             # Jednorázový sken kandidátů po ~1.2 s
-            if not did_candidate_scan and (_time.monotonic() - start) > 1.2:
+            if price_value is None and not did_candidate_scan and (_time.monotonic() - start) > 1.2:
                 did_candidate_scan = True
                 try:
                     cands = await page.evaluate("""() => {
@@ -364,21 +398,56 @@ async def fetch_value(url: str, selector: str, wait_selector: Optional[str], tim
                         txtc = c.get('txt') or ''
                         try:
                             v = parse_number(txtc)
-                            if v > 0: vals.append(v)
+                            if v > 0:
+                                vals.append(v)
                         except Exception:
                             continue
                     if vals:
+                        baseline = t.baseline
                         if baseline is not None:
                             vals.sort(key=lambda x: abs(x - float(baseline)))
                         else:
                             vals.sort(key=lambda x: -x)
-                        return float(vals[0])
+                        price_value = float(vals[0])
+                        break
                 except Exception:
                     pass
 
             await page.wait_for_timeout(250)
 
-        raise RuntimeError(f"Timeout bez nalezení čísla (ukázka: {last_text_sample[:80]!r})")
+        if price_value is None:
+            raise RuntimeError(f"Timeout bez nalezení čísla (ukázka: {last_text_sample[:80]!r})")
+
+        async def _read_bonus(sel: str) -> Optional[str]:
+            try:
+                loc_bonus = page.locator(sel)
+                await loc_bonus.wait_for(state="attached", timeout=min(2000, timeout_ms))
+                txt_bonus = ""
+                try:
+                    txt_bonus = (await loc_bonus.inner_text()).strip()
+                except Exception:
+                    pass
+                if not txt_bonus:
+                    try:
+                        raw = await loc_bonus.text_content()
+                        txt_bonus = (raw or "").strip()
+                    except Exception:
+                        pass
+                if not txt_bonus:
+                    try:
+                        txt_bonus = (await loc_bonus.evaluate("el => (el.innerText || el.textContent || '').trim()")) or ""
+                    except Exception:
+                        pass
+                return txt_bonus or None
+            except Exception:
+                return None
+
+        bonus: Dict[int, Optional[str]] = {}
+        for idx, sel in ((1, t.bonus1_selector), (2, t.bonus2_selector)):
+            if sel and sel.strip():
+                bonus[idx] = await _read_bonus(sel.strip())
+
+        return float(price_value), bonus
     finally:
         await browser.close()
         if close_pw:
@@ -420,16 +489,20 @@ def db_all_targets() -> List[Target]:
         for r in rows:
             d = dict(r)
             d.setdefault("description", None)
-            d.setdefault("wait_selector", None)
             d.setdefault("timeout_ms", None)
+            d.setdefault("bonus1_selector", None)
+            d.setdefault("bonus1_text", None)
+            d.setdefault("bonus2_selector", None)
+            d.setdefault("bonus2_text", None)
+            d.pop("wait_selector", None)
             out.append(Target(**d))
         return out
 
-def db_insert_target(url: str, selector: str, baseline: float, description: Optional[str], wait_selector: Optional[str]) -> int:
+def db_insert_target(url: str, selector: str, baseline: float, description: Optional[str]) -> int:
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
-            "INSERT INTO targets(url,selector,attr,baseline,active,note,created_at,description,wait_selector) VALUES (?,?,?,?,?,?,?,?,?)",
-            (url, selector, 'textContent', baseline, 1, None, datetime.now(timezone.utc).isoformat(), description, wait_selector)
+            "INSERT INTO targets(url,selector,attr,baseline,active,note,created_at,description) VALUES (?,?,?,?,?,?,?,?)",
+            (url, selector, 'textContent', baseline, 1, None, datetime.now(timezone.utc).isoformat(), description)
         )
         return cur.lastrowid
 
@@ -437,9 +510,22 @@ def db_update_description(target_id: int, description: str) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute("UPDATE targets SET description=? WHERE id=?", (description, target_id))
 
-def db_update_wait_selector(target_id: int, wait_selector: str) -> None:
+def db_update_bonus(target_id: int, index: int, selector: Optional[str], text_value: Optional[str]) -> None:
+    sel_col = "bonus1_selector" if index == 1 else "bonus2_selector"
+    text_col = "bonus1_text" if index == 1 else "bonus2_text"
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("UPDATE targets SET wait_selector=? WHERE id=?", (wait_selector, target_id))
+        con.execute(
+            f"UPDATE targets SET {sel_col}=?, {text_col}=? WHERE id=?",
+            (selector, text_value, target_id)
+        )
+
+def db_update_bonus_text(target_id: int, index: int, text_value: Optional[str]) -> None:
+    text_col = "bonus1_text" if index == 1 else "bonus2_text"
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            f"UPDATE targets SET {text_col}=? WHERE id=?",
+            (text_value, target_id)
+        )
 
 def db_delete_target(target_id: int) -> None:
     with sqlite3.connect(DB_PATH) as con:
@@ -486,13 +572,18 @@ class MainWindow(QMainWindow):
     COL_ID = 0
     COL_URL = 1
     COL_DESC = 2
-    COL_WAIT = 3
-    COL_BASE = 4
-    COL_LAST = 5
-    COL_TIME = 6
-    COL_DELTA = 7
-    COL_ACTIVE = 8
-    COL_ACTIONS = 9
+    COL_BASE = 3
+    COL_LAST = 4
+    COL_TIME = 5
+    COL_DELTA = 6
+    COL_BONUS1 = 7
+    COL_BONUS2 = 8
+    COL_ACTIVE = 9
+    COL_ACTIONS = 10
+
+    ROLE_BONUS_HAS_SELECTOR = Qt.UserRole + 10
+    ROLE_BONUS_MARK = Qt.UserRole + 11
+    BONUS_MARKER = "⚑"
 
     def __init__(self):
         super().__init__()
@@ -506,21 +597,19 @@ class MainWindow(QMainWindow):
         top = QWidget()
         top_layout = QVBoxLayout(top)
 
-        # URL bar + Popis + Čekat na + Přidat
+        # URL bar + Popis + Přidat
         bar = QHBoxLayout()
         self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("URL… (Shift+Click pro výběr čísla)")
         self.desc_edit = QLineEdit(); self.desc_edit.setPlaceholderText("Popis… (volitelně)")
-        self.wait_edit = QLineEdit(); self.wait_edit.setPlaceholderText("Čekat na (CSS, volitelně)")
         btn_add = QPushButton("Přidat a označit…")
         bar.addWidget(QLabel("URL:")); bar.addWidget(self.url_edit, 4)
         bar.addWidget(QLabel("Popis:")); bar.addWidget(self.desc_edit, 2)
-        bar.addWidget(QLabel("Čekat na:")); bar.addWidget(self.wait_edit, 2)
         bar.addWidget(btn_add, 1)
         top_layout.addLayout(bar)
 
         # Table
-        self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(["ID", "URL", "Popis", "Čekat na", "Baseline", "Poslední", "Načteno", "Změna", "Aktivní", "Akce"])
+        self.table = QTableWidget(0, 11)
+        self.table.setHorizontalHeaderLabels(["ID", "URL", "Popis", "Baseline", "Poslední", "Načteno", "Změna", "Bonus I", "Bonus II", "Aktivní", "Akce"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # výběr zcela vypneme, aby se Akce nikdy nevymalovala
@@ -528,6 +617,7 @@ class MainWindow(QMainWindow):
         self.table.setStyleSheet('QTableWidget::item:selected{ background: transparent; }')
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
         self.table.setSortingEnabled(True)
+        self.table.setColumnHidden(self.COL_ID, True)
         top_layout.addWidget(self.table)
 
         # Bottom
@@ -559,11 +649,11 @@ class MainWindow(QMainWindow):
         # Signals
         self.url_edit.returnPressed.connect(lambda: asyncio.get_event_loop().create_task(self.on_add()))
         self.desc_edit.returnPressed.connect(lambda: asyncio.get_event_loop().create_task(self.on_add()))
-        self.wait_edit.returnPressed.connect(lambda: asyncio.get_event_loop().create_task(self.on_add()))
         btn_add.clicked.connect(lambda: asyncio.get_event_loop().create_task(self.on_add()))
         self.btn_refresh.clicked.connect(lambda: asyncio.get_event_loop().create_task(self._refresh_busy()))
         self.table.horizontalHeader().sectionResized.connect(self.save_column_widths)
         self.table.itemChanged.connect(self.on_item_changed)
+        self.table.cellClicked.connect(self.on_cell_clicked)
 
         # Load
         self.reload_table()
@@ -662,9 +752,6 @@ class MainWindow(QMainWindow):
         # Popis (editable)
         desc_item = TextItem(t.description or ""); desc_item.setFlags(desc_item.flags() | Qt.ItemIsEditable)
         self.table.setItem(row, self.COL_DESC, desc_item)
-        # Čekat na (editable)
-        wait_item = TextItem(t.wait_selector or ""); wait_item.setFlags(wait_item.flags() | Qt.ItemIsEditable)
-        self.table.setItem(row, self.COL_WAIT, wait_item)
         # Baseline
         base_item = NumItem(str(t.baseline)); base_item.setData(Qt.UserRole, t.baseline)
         self.table.setItem(row, self.COL_BASE, base_item)
@@ -683,6 +770,14 @@ class MainWindow(QMainWindow):
             color = Qt.darkGreen if delta < 0 else (Qt.red if delta > 0 else Qt.black)
             delta_item.setForeground(color)
         self.table.setItem(row, self.COL_DELTA, delta_item)
+        # Bonus I
+        bonus1_item = TextItem("")
+        self.table.setItem(row, self.COL_BONUS1, bonus1_item)
+        self._configure_bonus_item(bonus1_item, t.bonus1_text, bool(t.bonus1_selector))
+        # Bonus II
+        bonus2_item = TextItem("")
+        self.table.setItem(row, self.COL_BONUS2, bonus2_item)
+        self._configure_bonus_item(bonus2_item, t.bonus2_text, bool(t.bonus2_selector))
         # Active
         chk = QCheckBox(); chk.setChecked(bool(t.active))
         chk.stateChanged.connect(lambda state, tid=t.id: db_set_active(tid, 1 if state==Qt.Checked else 0))
@@ -699,6 +794,38 @@ class MainWindow(QMainWindow):
 
         # Initial color
         self.set_row_color(row, None)
+
+    def _configure_bonus_item(self, item: QTableWidgetItem, text_value: Optional[str], has_selector: bool):
+        item.setFlags((item.flags() | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+        cleaned = (text_value or "").strip()
+        is_marker = bool(has_selector and not cleaned)
+        item.setData(Qt.UserRole, cleaned)
+        item.setData(self.ROLE_BONUS_HAS_SELECTOR, 1 if has_selector else 0)
+        item.setData(self.ROLE_BONUS_MARK, 1 if is_marker else 0)
+        if has_selector:
+            if is_marker:
+                item.setText(self.BONUS_MARKER)
+                item.setToolTip("Text je definován, ale nebyl nalezen. Kliknutím zrušíte hlídání.")
+            else:
+                item.setText(cleaned)
+                item.setToolTip(cleaned)
+        else:
+            item.setText("")
+            item.setToolTip("")
+
+    def _update_bonus_columns(self, row: int, t: Target, bonus_results: Dict[int, Optional[str]]):
+        for idx, col in ((1, self.COL_BONUS1), (2, self.COL_BONUS2)):
+            item = self.table.item(row, col)
+            if item is None:
+                continue
+            selector = getattr(t, f"bonus{idx}_selector")
+            if selector:
+                text_value = bonus_results.get(idx)
+                setattr(t, f"bonus{idx}_text", text_value)
+                self._configure_bonus_item(item, text_value, True)
+            else:
+                setattr(t, f"bonus{idx}_text", None)
+                self._configure_bonus_item(item, None, False)
 
     def set_row_color(self, row: int, relation: Optional[int], error: bool = False):
         pal = getattr(self, 'highlight_colors', {
@@ -753,8 +880,56 @@ class MainWindow(QMainWindow):
         tid = self.row_target_id(row)
         if item.column() == self.COL_DESC:
             db_update_description(tid, item.text())
-        elif item.column() == self.COL_WAIT:
-            db_update_wait_selector(tid, item.text())
+
+    def on_cell_clicked(self, row: int, column: int):
+        if column in (self.COL_BONUS1, self.COL_BONUS2):
+            asyncio.get_event_loop().create_task(self.handle_bonus_click(row, column))
+
+    async def handle_bonus_click(self, row: int, column: int):
+        item = self.table.item(row, column)
+        if item is None:
+            return
+        tid = self.row_target_id(row)
+        target = next((x for x in self.targets if x.id == tid), None)
+        if not target:
+            return
+        idx = 1 if column == self.COL_BONUS1 else 2
+        has_selector = bool(item.data(self.ROLE_BONUS_HAS_SELECTOR))
+        is_marker = bool(item.data(self.ROLE_BONUS_MARK))
+
+        if has_selector and is_marker:
+            db_update_bonus(tid, idx, None, None)
+            if idx == 1:
+                target.bonus1_selector = None
+                target.bonus1_text = None
+            else:
+                target.bonus2_selector = None
+                target.bonus2_text = None
+            self._configure_bonus_item(item, None, False)
+            return
+
+        url_item = self.table.item(row, self.COL_URL)
+        if url_item is None:
+            return
+        url = url_item.text()
+
+        self.setEnabled(False)
+        try:
+            selector, text_value = await capture_text_snippet(url)
+            cleaned = text_value.strip()
+            stored_text = cleaned or None
+            db_update_bonus(tid, idx, selector, stored_text)
+            if idx == 1:
+                target.bonus1_selector = selector
+                target.bonus1_text = stored_text
+            else:
+                target.bonus2_selector = selector
+                target.bonus2_text = stored_text
+            self._configure_bonus_item(item, stored_text, True)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Nepodařilo se načíst text: {e}")
+        finally:
+            self.setEnabled(True)
 
     async def _measure_one_busy(self, btn: QtWidgets.QPushButton, t: Target, row: int):
         self._set_button_busy(btn, True)
@@ -766,14 +941,13 @@ class MainWindow(QMainWindow):
     async def on_add(self):
         url = self.url_edit.text().strip()
         desc = self.desc_edit.text().strip() or None
-        wait = self.wait_edit.text().strip() or None
         if not url:
             return
         self.setEnabled(False)
         try:
             selector, baseline = await capture_target(url)
-            new_id = db_insert_target(url, selector, baseline, description=desc, wait_selector=wait)
-            self.url_edit.clear(); self.desc_edit.clear(); self.wait_edit.clear()
+            new_id = db_insert_target(url, selector, baseline, description=desc)
+            self.url_edit.clear(); self.desc_edit.clear()
             self.reload_table()
             QMessageBox.information(self, APP_NAME, f"Uloženo (ID {new_id})\nBaseline: {baseline}")
         except Exception as e:
@@ -803,7 +977,7 @@ class MainWindow(QMainWindow):
 
     async def measure_one(self, t: Target, row: int):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details = await measure_target(t, timeout)
+        val, ok, details, bonus_results = await measure_target(t, timeout)
         is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
         delta = None if val != val else (val - t.baseline)
         ts = datetime.now(timezone.utc).astimezone().strftime("%d.%m - %H:%M")
@@ -831,6 +1005,8 @@ class MainWindow(QMainWindow):
         if not is_error and val == val:
             relation = -1 if val < t.baseline else (1 if val > t.baseline else 0)
         self.set_row_color(row, relation, error=is_error)
+        if isinstance(bonus_results, dict):
+            self._update_bonus_columns(row, t, bonus_results)
 
     async def refresh_active(self):
         await self.on_refresh()
@@ -852,16 +1028,40 @@ class MainWindow(QMainWindow):
             await self.measure_one(t, row)
 
 # ---- Batch ----
-async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str]]:
+async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Dict[int, Optional[str]]]:
     try:
-        val = await fetch_value(t.url, t.selector, t.wait_selector, timeout_ms, t.baseline)
-        ok = val >= t.baseline
-        details = None if ok else f"Pokles z {t.baseline} na {val}"
+        val, bonus = await fetch_target_data(t, timeout_ms)
+        missing = []
+        for idx in (1, 2):
+            selector = getattr(t, f"bonus{idx}_selector")
+            if not selector:
+                continue
+            text_value = bonus.get(idx)
+            db_update_bonus_text(t.id, idx, text_value)
+            setattr(t, f"bonus{idx}_text", text_value)
+            if not text_value:
+                missing.append(idx)
+
+        drop_message = None
+        if val < t.baseline:
+            drop_message = f"Pokles z {t.baseline} na {val}"
+
+        if missing:
+            bonus_names = {1: "Bonus I", 2: "Bonus II"}
+            parts = [f"{bonus_names[m]} text nenalezen" for m in missing]
+            if drop_message:
+                parts.append(drop_message)
+            details = "Chyba: " + "; ".join(parts)
+            ok = False
+        else:
+            details = drop_message
+            ok = val >= t.baseline
+
         db_insert_check(t.id, val, int(ok), details)
-        return val, ok, details
+        return val, ok, details, bonus
     except Exception as e:
         db_insert_check(t.id, -1.0, 0, f"Chyba: {e}")
-        return float('nan'), False, f"Chyba: {e}"
+        return float('nan'), False, f"Chyba: {e}", {}
 
 async def run_batch(send_mail_on_drop: bool = True) -> int:
     targets = [t for t in db_all_targets() if t.active]
@@ -874,7 +1074,7 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
 
     for t in targets:
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details = await measure_target(t, timeout)
+        val, ok, details, bonus = await measure_target(t, timeout)
         is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
         status = "OK"
         if is_error:
@@ -882,6 +1082,14 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
         elif not ok:
             status = "POKLES"; drops.append((t, val, details))
         print(f"[{status}] id={t.id} {t.url}\n  baseline={t.baseline} observed={val} details={details or '-'}")
+        bonus_lines = []
+        if isinstance(bonus, dict):
+            for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
+                if getattr(t, f"bonus{idx}_selector"):
+                    txt = bonus.get(idx)
+                    bonus_lines.append(f"{label}={'-' if not txt else txt}")
+        if bonus_lines:
+            print("  " + " | ".join(bonus_lines))
 
     if send_mail_on_drop and (drops or errors):
         rows_drops = ''.join([
