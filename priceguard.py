@@ -556,6 +556,7 @@ def db_update_bonus_text(target_id: int, index: int, text_value: Optional[str]) 
 
 def db_delete_target(target_id: int) -> None:
     with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM checks WHERE target_id=?", (target_id,))
         con.execute("DELETE FROM targets WHERE id=?", (target_id,))
 
 def db_set_active(target_id: int, active: int) -> None:
