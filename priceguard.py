@@ -567,6 +567,37 @@ class NumItem(QTableWidgetItem):
 class TextItem(QTableWidgetItem):
     pass
 
+class BonusCellWidget(QtWidgets.QWidget):
+    clear_clicked = QtCore.Signal()
+
+    def __init__(self, marker: str, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        self.label = QtWidgets.QLabel()
+        self.label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        layout.addWidget(self.label, 1)
+
+        self.button = QtWidgets.QToolButton()
+        self.button.setText(marker)
+        self.button.setCursor(Qt.PointingHandCursor)
+        self.button.setAutoRaise(True)
+        self.button.setFocusPolicy(Qt.NoFocus)
+        self.button.setVisible(False)
+        self.button.clicked.connect(self.clear_clicked.emit)
+        layout.addWidget(self.button, 0)
+
+    def set_warning(self, warn: bool):
+        if warn:
+            self.label.setStyleSheet("color: palette(mid); font-style: italic;")
+        else:
+            self.label.setStyleSheet("")
+
 # ---- App core ----
 class MainWindow(QMainWindow):
     COL_ID = 0
@@ -619,6 +650,8 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.setColumnHidden(self.COL_ID, True)
         top_layout.addWidget(self.table)
+
+        self._skip_bonus_click = False
 
         # Bottom
         bottom = QHBoxLayout()
@@ -773,10 +806,16 @@ class MainWindow(QMainWindow):
         # Bonus I
         bonus1_item = TextItem("")
         self.table.setItem(row, self.COL_BONUS1, bonus1_item)
+        bonus1_widget = BonusCellWidget(self.BONUS_MARKER, self.table)
+        bonus1_widget.clear_clicked.connect(lambda item=bonus1_item: self._on_bonus_clear_clicked(item))
+        self.table.setCellWidget(row, self.COL_BONUS1, bonus1_widget)
         self._configure_bonus_item(bonus1_item, t.bonus1_text, bool(t.bonus1_selector))
         # Bonus II
         bonus2_item = TextItem("")
         self.table.setItem(row, self.COL_BONUS2, bonus2_item)
+        bonus2_widget = BonusCellWidget(self.BONUS_MARKER, self.table)
+        bonus2_widget.clear_clicked.connect(lambda item=bonus2_item: self._on_bonus_clear_clicked(item))
+        self.table.setCellWidget(row, self.COL_BONUS2, bonus2_widget)
         self._configure_bonus_item(bonus2_item, t.bonus2_text, bool(t.bonus2_selector))
         # Active
         chk = QCheckBox(); chk.setChecked(bool(t.active))
@@ -795,6 +834,13 @@ class MainWindow(QMainWindow):
         # Initial color
         self.set_row_color(row, None)
 
+    def _bonus_widget_for_item(self, item: QTableWidgetItem) -> Optional[BonusCellWidget]:
+        index = self.table.indexFromItem(item)
+        if not index.isValid():
+            return None
+        widget = self.table.cellWidget(index.row(), index.column())
+        return widget if isinstance(widget, BonusCellWidget) else None
+
     def _configure_bonus_item(self, item: QTableWidgetItem, text_value: Optional[str], has_selector: bool):
         item.setFlags((item.flags() | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
         cleaned = (text_value or "").strip()
@@ -802,16 +848,27 @@ class MainWindow(QMainWindow):
         item.setData(Qt.UserRole, cleaned)
         item.setData(self.ROLE_BONUS_HAS_SELECTOR, 1 if has_selector else 0)
         item.setData(self.ROLE_BONUS_MARK, 1 if is_marker else 0)
+        tooltip = ""
+        button_tip = ""
         if has_selector:
             if is_marker:
-                item.setText(self.BONUS_MARKER)
-                item.setToolTip("Text je definován, ale nebyl nalezen. Kliknutím zrušíte hlídání.")
+                tooltip = "Text je definován, ale nebyl nalezen."
+                button_tip = tooltip + " Kliknutím zrušíte hlídání."
             else:
-                item.setText(cleaned)
-                item.setToolTip(cleaned)
-        else:
-            item.setText("")
-            item.setToolTip("")
+                tooltip = cleaned
+                button_tip = "Kliknutím zrušíte hlídání."
+        item.setText(cleaned)
+        item.setToolTip(button_tip or tooltip)
+        widget = self._bonus_widget_for_item(item)
+        if widget:
+            widget.label.setText(cleaned)
+            widget.label.setToolTip(tooltip)
+            widget.button.setVisible(has_selector)
+            widget.button.setToolTip(button_tip)
+            widget.set_warning(is_marker)
+        elif has_selector and is_marker:
+            item.setText(self.BONUS_MARKER)
+            item.setToolTip(button_tip)
 
     def _update_bonus_columns(self, row: int, t: Target, bonus_results: Dict[int, Optional[str]]):
         for idx, col in ((1, self.COL_BONUS1), (2, self.COL_BONUS2)):
@@ -885,7 +942,34 @@ class MainWindow(QMainWindow):
         if column in (self.COL_BONUS1, self.COL_BONUS2):
             asyncio.get_event_loop().create_task(self.handle_bonus_click(row, column))
 
+    def _on_bonus_clear_clicked(self, item: QTableWidgetItem):
+        index = self.table.indexFromItem(item)
+        if not index.isValid():
+            return
+        row = index.row()
+        column = index.column()
+        tid = self.row_target_id(row)
+        target = next((x for x in self.targets if x.id == tid), None)
+        if not target:
+            return
+        idx = 1 if column == self.COL_BONUS1 else 2
+        self._skip_bonus_click = True
+        def _reset_skip():
+            self._skip_bonus_click = False
+        QtCore.QTimer.singleShot(0, _reset_skip)
+        db_update_bonus(tid, idx, None, None)
+        if idx == 1:
+            target.bonus1_selector = None
+            target.bonus1_text = None
+        else:
+            target.bonus2_selector = None
+            target.bonus2_text = None
+        self._configure_bonus_item(item, None, False)
+
     async def handle_bonus_click(self, row: int, column: int):
+        if self._skip_bonus_click:
+            self._skip_bonus_click = False
+            return
         item = self.table.item(row, column)
         if item is None:
             return
@@ -894,19 +978,6 @@ class MainWindow(QMainWindow):
         if not target:
             return
         idx = 1 if column == self.COL_BONUS1 else 2
-        has_selector = bool(item.data(self.ROLE_BONUS_HAS_SELECTOR))
-        is_marker = bool(item.data(self.ROLE_BONUS_MARK))
-
-        if has_selector and is_marker:
-            db_update_bonus(tid, idx, None, None)
-            if idx == 1:
-                target.bonus1_selector = None
-                target.bonus1_text = None
-            else:
-                target.bonus2_selector = None
-                target.bonus2_text = None
-            self._configure_bonus_item(item, None, False)
-            return
 
         url_item = self.table.item(row, self.COL_URL)
         if url_item is None:
