@@ -234,6 +234,14 @@ async def capture_target(url: str) -> Tuple[str, float]:
     pw, browser, page = await launch_browser_headed()
     try:
         fut = asyncio.get_event_loop().create_future()
+
+        def on_close():
+            if not fut.done():
+                fut.set_exception(RuntimeError("Výběr byl zrušen (okno zavřeno)."))
+
+        page.on("close", on_close)
+        browser.on("disconnected", on_close)
+
         async def on_pick(selector, text_value):
             if not fut.done():
                 fut.set_result((selector, text_value))
@@ -253,13 +261,26 @@ async def capture_target(url: str) -> Tuple[str, float]:
         value = parse_number(txt)
         return selector, value
     finally:
-        await browser.close()
-        await pw.stop()
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        try:
+            await pw.stop()
+        except Exception:
+            pass
 
 async def capture_text_snippet(url: str) -> Tuple[str, str]:
     pw, browser, page = await launch_browser_headed()
     try:
         fut = asyncio.get_event_loop().create_future()
+
+        def on_close():
+            if not fut.done():
+                fut.set_exception(RuntimeError("Výběr byl zrušen (okno zavřeno)."))
+
+        page.on("close", on_close)
+        browser.on("disconnected", on_close)
 
         async def on_pick(selector, text_value):
             if not fut.done():
@@ -277,8 +298,14 @@ async def capture_text_snippet(url: str) -> Tuple[str, str]:
         selector, text_value = await fut
         return selector, text_value
     finally:
-        await browser.close()
-        await pw.stop()
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        try:
+            await pw.stop()
+        except Exception:
+            pass
 
 async def _maybe_accept_cookies(page):
     sel = "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('Přijmout vše'), button:has-text('Přijmout'), button:has-text('Souhlasím')"
