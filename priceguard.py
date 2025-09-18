@@ -24,6 +24,7 @@ Spuštění:
 """
 from __future__ import annotations
 import asyncio
+import math
 import os
 import re
 import sqlite3
@@ -37,11 +38,19 @@ from typing import Optional, Tuple, List, Dict
 
 from dotenv import load_dotenv
 from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6.QtCharts import (
+    QChart,
+    QChartView,
+    QDateTimeAxis,
+    QLineSeries,
+    QValueAxis
+)
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
-    QMessageBox, QAbstractItemView, QHeaderView, QCheckBox, QLabel
+    QMessageBox, QAbstractItemView, QHeaderView, QCheckBox, QLabel,
+    QDialogButtonBox
 )
 from qasync import QEventLoop
 from playwright.async_api import async_playwright
@@ -76,6 +85,16 @@ CREATE TABLE IF NOT EXISTS checks(
   ok INT NOT NULL,
   fetched_at DATETIME NOT NULL,
   details TEXT
+);
+CREATE TABLE IF NOT EXISTS daily_stats(
+  id INTEGER PRIMARY KEY,
+  target_id INT NOT NULL,
+  stat_date TEXT NOT NULL,
+  observed REAL,
+  bonus1_present INT,
+  bonus2_present INT,
+  recorded_at DATETIME NOT NULL,
+  UNIQUE(target_id, stat_date)
 );
 """
 
@@ -161,6 +180,23 @@ def init_db() -> None:
                 con.execute(f"ALTER TABLE targets ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
+        # Historie denních měření
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS daily_stats("
+            "id INTEGER PRIMARY KEY,"
+            "target_id INT NOT NULL,"
+            "stat_date TEXT NOT NULL,"
+            "observed REAL,"
+            "bonus1_present INT,"
+            "bonus2_present INT,"
+            "recorded_at DATETIME NOT NULL,"
+            "UNIQUE(target_id, stat_date)"
+            ")"
+        )
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_stats_target_date "
+            "ON daily_stats(target_id, stat_date)"
+        )
 
 def parse_number(text: str) -> float:
     """Vytáhne první smysluplné číslo z textu (cz/en formáty) a převede na float."""
@@ -570,6 +606,36 @@ def db_insert_check(target_id: int, observed: float, ok: int, details: Optional[
             (target_id, observed, ok, datetime.now(timezone.utc).isoformat(), details)
         )
 
+def db_log_daily_stat(target_id: int, observed: Optional[float], bonus_presence: Dict[int, Optional[bool]]) -> None:
+    today = datetime.now(timezone.utc).astimezone().date().isoformat()
+    recorded_at = datetime.now(timezone.utc).isoformat()
+
+    def _to_int(flag: Optional[bool]) -> Optional[int]:
+        if flag is None:
+            return None
+        return 1 if flag else 0
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        exists = con.execute(
+            "SELECT 1 FROM daily_stats WHERE target_id=? AND stat_date=?",
+            (target_id, today)
+        ).fetchone()
+        if exists:
+            return
+        con.execute(
+            "INSERT INTO daily_stats(target_id, stat_date, observed, bonus1_present, bonus2_present, recorded_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                target_id,
+                today,
+                observed,
+                _to_int(bonus_presence.get(1)),
+                _to_int(bonus_presence.get(2)),
+                recorded_at
+            )
+        )
+
 def db_get_last_check(target_id: int) -> Tuple[Optional[float], Optional[str]]:
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -582,6 +648,16 @@ def db_get_last_check(target_id: int) -> Tuple[Optional[float], Optional[str]]:
         val = float(row["observed"]) if row["observed"] is not None else None
         ts = row["fetched_at"]
         return val, ts
+
+def db_get_daily_stats(target_id: int) -> List[Dict[str, Optional[float]]]:
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT stat_date, observed, bonus1_present, bonus2_present, recorded_at "
+            "FROM daily_stats WHERE target_id=? ORDER BY stat_date",
+            (target_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 # ---- Sorting helpers ----
 class NumItem(QTableWidgetItem):
@@ -625,6 +701,149 @@ class BonusCellWidget(QtWidgets.QWidget):
             self.label.setStyleSheet("color: palette(mid); font-style: italic;")
         else:
             self.label.setStyleSheet("")
+
+class HistoryDialog(QtWidgets.QDialog):
+    def __init__(self, parent: Optional[QtWidgets.QWidget], target: Target, stats: List[Dict[str, Optional[float]]]):
+        super().__init__(parent)
+        self.setWindowTitle(f"Vývoj ceny – ID {target.id}")
+        self.resize(720, 420)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        if not stats:
+            label = QtWidgets.QLabel("Pro tento cíl zatím nejsou denní záznamy.")
+            label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(label)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+            buttons.rejected.connect(self.reject)
+            buttons.accepted.connect(self.accept)
+            layout.addWidget(buttons)
+            return
+
+        price_series = QLineSeries()
+        price_series.setName("Cena")
+        price_series.setColor(QtGui.QColor("#2b7cd3"))
+        price_series.setPointsVisible(True)
+        price_series.setUseOpenGL(False)
+
+        bonus_data: Dict[int, List[Tuple[int, int]]] = {1: [], 2: []}
+        x_values: List[int] = []
+        price_values: List[float] = []
+
+        for row in stats:
+            recorded_at = row.get("recorded_at") or ""
+            dt: Optional[datetime]
+            try:
+                dt = datetime.fromisoformat(recorded_at.replace("Z", "")) if recorded_at else None
+            except Exception:
+                dt = None
+            if dt is None:
+                try:
+                    dt = datetime.fromisoformat(f"{row.get('stat_date')}T00:00:00")
+                except Exception:
+                    continue
+            qdt = QtCore.QDateTime(dt)
+            x = qdt.toMSecsSinceEpoch()
+            x_values.append(x)
+
+            observed = row.get("observed")
+            if observed is not None:
+                try:
+                    price = float(observed)
+                except Exception:
+                    price = None
+                if price is not None and math.isfinite(price):
+                    price_series.append(x, price)
+                    price_values.append(price)
+
+            for idx in (1, 2):
+                presence = row.get(f"bonus{idx}_present")
+                if presence is None:
+                    continue
+                try:
+                    val_int = int(presence)
+                except Exception:
+                    continue
+                bonus_data[idx].append((x, val_int))
+
+        chart = QChart()
+        chart.addSeries(price_series)
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignBottom)
+        chart.setAnimationOptions(QChart.NoAnimation)
+        chart.setTitle(target.description or target.url)
+
+        axis_x = QDateTimeAxis()
+        axis_x.setFormat("dd.MM")
+        axis_x.setTitleText("Datum")
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        price_series.attachAxis(axis_x)
+
+        axis_y_price = QValueAxis()
+        axis_y_price.setTitleText("Cena")
+        chart.addAxis(axis_y_price, Qt.AlignLeft)
+        price_series.attachAxis(axis_y_price)
+
+        if price_values:
+            min_price = min(price_values)
+            max_price = max(price_values)
+            if math.isclose(min_price, max_price):
+                pad = max(1.0, abs(min_price) * 0.1 or 1.0)
+                axis_y_price.setRange(min_price - pad, max_price + pad)
+            else:
+                pad = (max_price - min_price) * 0.1
+                axis_y_price.setRange(min_price - pad, max_price + pad)
+        else:
+            axis_y_price.setRange(0, 1)
+
+        if x_values:
+            min_x = min(x_values)
+            max_x = max(x_values)
+            if min_x == max_x:
+                span = 24 * 3600 * 1000
+                min_x -= span // 2
+                max_x += span // 2
+            axis_x.setRange(QtCore.QDateTime.fromMSecsSinceEpoch(min_x), QtCore.QDateTime.fromMSecsSinceEpoch(max_x))
+            axis_x.setTickCount(max(2, min(len(set(x_values)) + 1, 8)))
+
+        bonus_axis_added = False
+        axis_y_bonus = QValueAxis()
+        axis_y_bonus.setRange(-0.1, 1.1)
+        axis_y_bonus.setLabelFormat("%d")
+        axis_y_bonus.setTitleText("Bonus (1 = ano)")
+        axis_y_bonus.setTickCount(3)
+
+        bonus_colors = {
+            1: QtGui.QColor("#2e7d32"),
+            2: QtGui.QColor("#ad1457")
+        }
+
+        for idx in (1, 2):
+            points = bonus_data[idx]
+            if not points:
+                continue
+            series = QLineSeries()
+            series.setName(f"Bonus {'I' if idx == 1 else 'II'}")
+            series.setColor(bonus_colors.get(idx, QtGui.QColor("#555555")))
+            series.setPointsVisible(True)
+            series.setUseOpenGL(False)
+            for x, val in points:
+                series.append(x, val)
+            chart.addSeries(series)
+            series.attachAxis(axis_x)
+            if not bonus_axis_added:
+                chart.addAxis(axis_y_bonus, Qt.AlignRight)
+                bonus_axis_added = True
+            series.attachAxis(axis_y_bonus)
+
+        view = QChartView(chart)
+        view.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        layout.addWidget(view)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
 
 # ---- App core ----
 class MainWindow(QMainWindow):
@@ -828,7 +1047,11 @@ class MainWindow(QMainWindow):
         else:
             delta_item = NumItem(("+%s" % delta) if delta >= 0 else str(delta))
             delta_item.setData(Qt.UserRole, float(delta))
-            color = Qt.darkGreen if delta < 0 else (Qt.red if delta > 0 else Qt.black)
+            if delta != 0:
+                font = delta_item.font()
+                font.setBold(True)
+                delta_item.setFont(font)
+            color = QtGui.QBrush(self._delta_color(delta))
             delta_item.setForeground(color)
         self.table.setItem(row, self.COL_DELTA, delta_item)
         # Bonus I
@@ -952,6 +1175,18 @@ class MainWindow(QMainWindow):
         pm.fill(color)
         return QtGui.QIcon(pm)
 
+    def _delta_color(self, delta: float) -> QtGui.QColor:
+        highlight = getattr(self, 'highlight_colors', None)
+        if delta < 0:
+            if isinstance(highlight, dict):
+                return highlight.get('accent_good', QtGui.QColor(0, 170, 0))
+            return QtGui.QColor(0, 170, 0)
+        if delta > 0:
+            if isinstance(highlight, dict):
+                return highlight.get('accent_bad', QtGui.QColor(220, 0, 0))
+            return QtGui.QColor(220, 0, 0)
+        return self.palette().color(QtGui.QPalette.WindowText)
+
     def row_target_id(self, row: int) -> int:
         return int(self.table.item(row, self.COL_ID).text())
 
@@ -967,7 +1202,15 @@ class MainWindow(QMainWindow):
             db_update_description(tid, item.text())
 
     def on_cell_clicked(self, row: int, column: int):
-        if column in (self.COL_BONUS1, self.COL_BONUS2):
+        if column == self.COL_DELTA:
+            tid = self.row_target_id(row)
+            target = next((x for x in self.targets if x.id == tid), None)
+            if not target:
+                return
+            stats = db_get_daily_stats(tid)
+            dlg = HistoryDialog(self, target, stats)
+            dlg.exec()
+        elif column in (self.COL_BONUS1, self.COL_BONUS2):
             asyncio.get_event_loop().create_task(self.handle_bonus_click(row, column))
 
     def _on_bonus_clear_clicked(self, item: QTableWidgetItem):
@@ -1076,7 +1319,7 @@ class MainWindow(QMainWindow):
 
     async def measure_one(self, t: Target, row: int):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details, bonus_results = await measure_target(t, timeout)
+        val, ok, details, bonus_results, _newly_filled = await measure_target(t, timeout)
         is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
         delta = None if val != val else (val - t.baseline)
         ts = datetime.now(timezone.utc).astimezone().strftime("%d.%m - %H:%M")
@@ -1096,8 +1339,11 @@ class MainWindow(QMainWindow):
         else:
             delta_item = NumItem(("+%s" % delta) if delta >= 0 else str(delta))
             delta_item.setData(Qt.UserRole, float(delta))
-            color = Qt.darkGreen if delta < 0 else (Qt.red if delta > 0 else Qt.black)
-            delta_item.setForeground(color)
+            if delta != 0:
+                font = delta_item.font()
+                font.setBold(True)
+                delta_item.setFont(font)
+            delta_item.setForeground(QtGui.QBrush(self._delta_color(delta)))
         self.table.setItem(row, self.COL_DELTA, delta_item)
 
         relation = None
@@ -1127,10 +1373,15 @@ class MainWindow(QMainWindow):
             await self.measure_one(t, row)
 
 # ---- Batch ----
-async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Dict[int, Optional[str]]]:
+async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Dict[int, Optional[str]], List[int]]:
     try:
         val, bonus = await fetch_target_data(t, timeout_ms)
         missing = []
+        newly_filled: List[int] = []
+        previous_bonus = {
+            1: (t.bonus1_text or None),
+            2: (t.bonus2_text or None)
+        }
         for idx in (1, 2):
             selector = getattr(t, f"bonus{idx}_selector")
             if not selector:
@@ -1140,6 +1391,8 @@ async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optio
             setattr(t, f"bonus{idx}_text", text_value)
             if not text_value:
                 missing.append(idx)
+            elif not (previous_bonus.get(idx) or ""):
+                newly_filled.append(idx)
 
         drop_message = None
         if val < t.baseline:
@@ -1157,10 +1410,23 @@ async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optio
             ok = val >= t.baseline
 
         db_insert_check(t.id, val, int(ok), details)
-        return val, ok, details, bonus
+        presence_map: Dict[int, Optional[bool]] = {}
+        for idx in (1, 2):
+            selector = getattr(t, f"bonus{idx}_selector")
+            if not selector:
+                presence_map[idx] = None
+            else:
+                presence_map[idx] = bool(bonus.get(idx))
+
+        observed_for_log: Optional[float] = None
+        if isinstance(val, (int, float)) and math.isfinite(val):
+            observed_for_log = float(val)
+        db_log_daily_stat(t.id, observed_for_log, presence_map)
+
+        return val, ok, details, bonus, newly_filled
     except Exception as e:
         db_insert_check(t.id, -1.0, 0, f"Chyba: {e}")
-        return float('nan'), False, f"Chyba: {e}", {}
+        return float('nan'), False, f"Chyba: {e}", {}, []
 
 async def run_batch(send_mail_on_drop: bool = True) -> int:
     targets = [t for t in db_all_targets() if t.active]
@@ -1170,27 +1436,32 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
 
     drops = []   # (t, val, details)
     errors = []  # (t, details)
+    bonus_hits = []  # (t, idx)
 
     for t in targets:
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details, bonus = await measure_target(t, timeout)
+        val, ok, details, bonus, newly_filled = await measure_target(t, timeout)
         is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
         status = "OK"
         if is_error:
             status = "CHYBA"; errors.append((t, details))
         elif not ok:
             status = "POKLES"; drops.append((t, val, details))
+        if newly_filled:
+            for idx in newly_filled:
+                bonus_hits.append((t, idx))
         print(f"[{status}] id={t.id} {t.url}\n  baseline={t.baseline} observed={val} details={details or '-'}")
         bonus_lines = []
         if isinstance(bonus, dict):
             for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
                 if getattr(t, f"bonus{idx}_selector"):
                     txt = bonus.get(idx)
-                    bonus_lines.append(f"{label}={'-' if not txt else txt}")
+                    suffix = " (nové)" if idx in newly_filled else ""
+                    bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
         if bonus_lines:
             print("  " + " | ".join(bonus_lines))
 
-    if send_mail_on_drop and (drops or errors):
+    if send_mail_on_drop and (drops or errors or bonus_hits):
         rows_drops = ''.join([
             f"<tr><td>POKLES</td><td>{d[0].id}</td><td>{(d[0].description or '')}</td><td>{d[0].url}</td><td>{d[0].baseline}</td><td>{d[1]}</td><td>{d[2] or ''}</td></tr>"
             for d in drops
@@ -1199,18 +1470,22 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
             f"<tr><td>CHYBA</td><td>{e[0].id}</td><td>{(e[0].description or '')}</td><td>{e[0].url}</td><td colspan=2>-</td><td>{e[1] or ''}</td></tr>"
             for e in errors
         ])
+        rows_bonus = ''.join([
+            f"<tr><td>BONUS</td><td>{b[0].id}</td><td>{(b[0].description or '')}</td><td>{b[0].url}</td><td colspan=2>-</td><td>{'Bonus I' if b[1]==1 else 'Bonus II'} nově nalezen</td></tr>"
+            for b in bonus_hits
+        ])
         html = f"""
         <h3>{APP_NAME}: report měření (batch)</h3>
-        <p><b>Poklesy:</b> {len(drops)} &nbsp;|&nbsp; <b>Chyby:</b> {len(errors)}</p>
+        <p><b>Poklesy:</b> {len(drops)} &nbsp;|&nbsp; <b>Chyby:</b> {len(errors)} &nbsp;|&nbsp; <b>Bonus nové:</b> {len(bonus_hits)}</p>
         <table border=1 cellspacing=0 cellpadding=6>
           <tr><th>Typ</th><th>ID</th><th>Popis</th><th>URL</th><th>Baseline</th><th>Observed</th><th>Detail</th></tr>
-          {rows_drops}{rows_errs}
+          {rows_drops}{rows_errs}{rows_bonus}
         </table>
         <p>{datetime.now(timezone.utc).isoformat()}</p>
         """
         send_email(f"{APP_NAME} batch: {len(drops)} pokles(ů), {len(errors)} chyb(a)", html)
 
-    return 1 if (drops or errors) else 0
+    return 1 if (drops or errors or bonus_hits) else 0
 
 # ---- Entry ----
 def run_gui():
