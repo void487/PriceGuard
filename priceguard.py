@@ -25,6 +25,7 @@ Spuštění:
 from __future__ import annotations
 import asyncio
 import math
+import random
 import os
 import re
 import sqlite3
@@ -1320,22 +1321,28 @@ class MainWindow(QMainWindow):
     async def measure_one(self, t: Target, row: int):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
         val, ok, details, bonus_results, _newly_filled = await measure_target(t, timeout)
-        is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
-        delta = None if val != val else (val - t.baseline)
+        measurement_failed = (val != val)
+        has_issue = bool(details and str(details).lower().startswith("chyba"))
+        if measurement_failed:
+            delta_item = self.table.item(row, self.COL_DELTA)
+            if delta_item is not None:
+                delta_item.setToolTip(details or "")
+            self.set_row_color(row, None, error=True)
+            return
+
+        delta = val - t.baseline
         ts = datetime.now(timezone.utc).astimezone().strftime("%d.%m - %H:%M")
 
         # Last
-        last_item = NumItem("-" if is_error or val != val else str(val))
-        last_item.setData(Qt.UserRole, float(val) if (not is_error and val == val) else float('nan'))
+        last_item = NumItem(str(val))
+        last_item.setData(Qt.UserRole, float(val))
         self.table.setItem(row, self.COL_LAST, last_item)
         # Time
         self.table.setItem(row, self.COL_TIME, TextItem(ts))
         # Delta
-        if is_error:
-            delta_item = NumItem("CHYBA"); delta_item.setData(Qt.UserRole, float('nan'))
-            delta_item.setForeground(QtGui.QBrush(Qt.black))
-        elif delta is None or delta != delta:
-            delta_item = NumItem("-"); delta_item.setData(Qt.UserRole, float('nan'))
+        if delta != delta:
+            delta_item = NumItem("-")
+            delta_item.setData(Qt.UserRole, float('nan'))
         else:
             delta_item = NumItem(("+%s" % delta) if delta >= 0 else str(delta))
             delta_item.setData(Qt.UserRole, float(delta))
@@ -1344,12 +1351,11 @@ class MainWindow(QMainWindow):
                 font.setBold(True)
                 delta_item.setFont(font)
             delta_item.setForeground(QtGui.QBrush(self._delta_color(delta)))
+        delta_item.setToolTip(details or "")
         self.table.setItem(row, self.COL_DELTA, delta_item)
 
-        relation = None
-        if not is_error and val == val:
-            relation = -1 if val < t.baseline else (1 if val > t.baseline else 0)
-        self.set_row_color(row, relation, error=is_error)
+        relation = -1 if val < t.baseline else (1 if val > t.baseline else 0)
+        self.set_row_color(row, relation, error=has_issue)
         if isinstance(bonus_results, dict):
             self._update_bonus_columns(row, t, bonus_results)
 
@@ -1365,15 +1371,21 @@ class MainWindow(QMainWindow):
 
     async def on_refresh(self):
         # samotné enable/disable řídí busy wrapper
+        active_items = []
         for row in range(self.table.rowCount()):
             tid = self.row_target_id(row)
             t = next((x for x in self.targets if x.id == tid), None)
             if not t or not t.active:
                 continue
+            active_items.append((row, t))
+
+        for idx, (row, t) in enumerate(active_items):
             await self.measure_one(t, row)
+            if idx < len(active_items) - 1:
+                await asyncio.sleep(random.uniform(5, 10))
 
 # ---- Batch ----
-async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Dict[int, Optional[str]], List[int]]:
+async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Optional[Dict[int, Optional[str]]], List[int]]:
     try:
         val, bonus = await fetch_target_data(t, timeout_ms)
         missing = []
@@ -1426,7 +1438,7 @@ async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optio
         return val, ok, details, bonus, newly_filled
     except Exception as e:
         db_insert_check(t.id, -1.0, 0, f"Chyba: {e}")
-        return float('nan'), False, f"Chyba: {e}", {}, []
+        return float('nan'), False, f"Chyba: {e}", None, []
 
 async def run_batch(send_mail_on_drop: bool = True) -> int:
     targets = [t for t in db_all_targets() if t.active]
@@ -1438,7 +1450,7 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
     errors = []  # (t, details)
     bonus_hits = []  # (t, idx)
 
-    for t in targets:
+    for idx, t in enumerate(targets):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
         val, ok, details, bonus, newly_filled = await measure_target(t, timeout)
         is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
@@ -1460,6 +1472,9 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
                     bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
         if bonus_lines:
             print("  " + " | ".join(bonus_lines))
+
+        if idx < len(targets) - 1:
+            await asyncio.sleep(random.uniform(5, 10))
 
     if send_mail_on_drop and (drops or errors or bonus_hits):
         rows_drops = ''.join([
