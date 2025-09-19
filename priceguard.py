@@ -1410,16 +1410,14 @@ async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optio
         if val < t.baseline:
             drop_message = f"Pokles z {t.baseline} na {val}"
 
+        details_parts: List[str] = []
         if missing:
             bonus_names = {1: "Bonus I", 2: "Bonus II"}
-            parts = [f"{bonus_names[m]} text nenalezen" for m in missing]
-            if drop_message:
-                parts.append(drop_message)
-            details = "Chyba: " + "; ".join(parts)
-            ok = False
-        else:
-            details = drop_message
-            ok = val >= t.baseline
+            details_parts.append("; ".join(f"{bonus_names[m]} text nenalezen" for m in missing))
+        if drop_message:
+            details_parts.append(drop_message)
+        details = "; ".join(details_parts) if details_parts else None
+        ok = val >= t.baseline
 
         db_insert_check(t.id, val, int(ok), details)
         presence_map: Dict[int, Optional[bool]] = {}
