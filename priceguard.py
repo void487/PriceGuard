@@ -923,9 +923,9 @@ class MainWindow(QMainWindow):
         for a in (self.actionThemeAuto, self.actionThemeLight, self.actionThemeDark):
             a.setActionGroup(self.theme_group)
             a.setCheckable(True)
-        self.actionThemeAuto.triggered.connect(lambda: self.set_theme('auto'))
-        self.actionThemeLight.triggered.connect(lambda: self.set_theme('light'))
-        self.actionThemeDark.triggered.connect(lambda: self.set_theme('dark'))
+        self.actionThemeAuto.triggered.connect(lambda checked=False: self.set_theme('auto'))
+        self.actionThemeLight.triggered.connect(lambda checked=False: self.set_theme('light'))
+        self.actionThemeDark.triggered.connect(lambda checked=False: self.set_theme('dark'))
 
         # Signals
         self.url_edit.returnPressed.connect(lambda: asyncio.get_event_loop().create_task(self.on_add()))
