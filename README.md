@@ -9,9 +9,10 @@ PriceGuard is a desktop helper that keeps an eye on the price of a product and t
    * A recent Chromium browser (downloaded automatically by Playwright).
 2. **Install Python dependencies**
    ```bash
-   pip install PySide6 qasync playwright==1.47.0 python-dotenv
+   pip install -r requirements.txt
    playwright install
    ```
+   The `requirements.txt` file contains the minimal set of packages needed to run PriceGuard.
 
 The project keeps all state inside `targets.db` in the working directory, so no extra database setup is required.
 
