@@ -1,0 +1,4 @@
+PySide6
+qasync
+playwright==1.47.0
+python-dotenv
