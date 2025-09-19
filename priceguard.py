@@ -1360,9 +1360,36 @@ class MainWindow(QMainWindow):
         measurement_failed = (val != val)
         has_issue = bool(details and str(details).lower().startswith("chyba"))
         if measurement_failed:
-            delta_item = self.table.item(row, self.COL_DELTA)
-            if delta_item is not None:
-                delta_item.setToolTip(details or "")
+            tooltip = details or ""
+
+            last_item = NumItem("-")
+            last_item.setData(Qt.UserRole, float('nan'))
+            last_item.setToolTip(tooltip)
+            self.table.setItem(row, self.COL_LAST, last_item)
+
+            time_item = TextItem("-")
+            time_item.setToolTip(tooltip)
+            self.table.setItem(row, self.COL_TIME, time_item)
+
+            error_text = "Chyba"
+            delta_item = NumItem(error_text)
+            delta_item.setData(Qt.UserRole, float('nan'))
+            delta_item.setToolTip(tooltip)
+
+            font = delta_item.font()
+            font.setBold(True)
+            delta_item.setFont(font)
+
+            highlight = getattr(self, 'highlight_colors', None)
+            if isinstance(highlight, dict):
+                err_color = highlight.get('accent_err')
+            else:
+                err_color = None
+            if err_color is None:
+                err_color = QtGui.QColor(220, 160, 0)
+            delta_item.setForeground(QtGui.QBrush(err_color))
+
+            self.table.setItem(row, self.COL_DELTA, delta_item)
             self.set_row_color(row, None, error=True)
             return
 
