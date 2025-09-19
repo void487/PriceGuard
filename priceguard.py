@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-PriceGuard – hlídání čísel z webu (GUI + batch)
+PriceGuard – monitor numbers from the web (GUI + batch)
 
-Hlavní vlastnosti
-- Výběr čísla přes Shift+Click (funguje i v Shadow DOM). Uloží se CSS selektor + baseline.
-- Univerzální načítání bez per‑web ladění:
-    • headless kontext napodobuje skutečný prohlížeč (UA, locale cs-CZ, timezone Europe/Prague),
-    • polling uvnitř DOM (žádné nekonečné reloady),
-    • fallbacky čtení (inner_text → text_content → JS innerText → inner_html),
-    • inteligentní sken kandidátů (meta/itemprop/JSON-LD/„price“ class/atributy) a výběr nejbližší hodnoty k baseline.
-- Tabulka: URL, Popis (editovatelné), Baseline, Poslední, Načteno, Změna, Bonus I, Bonus II, Aktivní, Akce (interní ID je skryté).
-- Dark/Light motiv s přepínačem (výchozí Automaticky) a jemné barvení řádků (sloupec Akce se NEbarví).
-- Tlačítka „Kontrola“/„Kontrola aktivních“ zobrazují běh (⏳) a jsou dočasně disable.
-- Dávka (`--batch`) posílá e-mail (poklesy + chyby). GUI maily neposílá.
+Main features
+- Select a number via Shift+Click (works inside Shadow DOM). The CSS selector and baseline value are stored.
+- Universal loading without per-site tuning:
+    • the headless context mimics a real browser (UA, locale cs-CZ, timezone Europe/Prague),
+    • polling happens within the DOM (no endless reloads),
+    • text reading fallbacks (inner_text → text_content → JS innerText → inner_html),
+    • smart candidate scan (meta/itemprop/JSON-LD/"price" classes/attributes) with nearest-to-baseline selection.
+- Table columns: URL, Description (editable), Baseline, Last, Fetched, Change, Bonus I, Bonus II, Active, Actions (internal ID is hidden).
+- Dark/Light theme with a toggle (Automatic by default) and subtle row highlighting (Actions column is never colored).
+- "Check"/"Check active" buttons show progress (⏳) and are temporarily disabled.
+- Batch mode (`--batch`) sends an email (drops + errors). The GUI never sends emails.
 
-Závislosti:
+Dependencies:
   pip install PySide6 qasync playwright==1.47.0 python-dotenv
   playwright install
 
-Spuštění:
+Run:
   python priceguard.py          # GUI
-  python priceguard.py --batch  # dávkově, vrací 1 pokud je pokles nebo chyba, jinak 0
+  python priceguard.py --batch  # batch mode, returns 1 if a drop or error occurs, otherwise 0
 """
 from __future__ import annotations
 import asyncio
@@ -158,7 +158,7 @@ PICKER_JS = r"""
   };
   document.addEventListener('click', onClick, true);
   window.addEventListener('click', onClick, true);
-  console.log('[PriceGuard] Shift+Click na číslo pro výběr (podpora Shadow DOM).');
+  console.log('[PriceGuard] Shift+Click a number to select it (Shadow DOM supported).');
 })();
 """
 
@@ -182,7 +182,7 @@ def init_db() -> None:
                 con.execute(f"ALTER TABLE targets ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
-        # Historie denních měření
+        # Daily measurement history
         con.execute(
             "CREATE TABLE IF NOT EXISTS daily_stats("
             "id INTEGER PRIMARY KEY,"
@@ -201,12 +201,12 @@ def init_db() -> None:
         )
 
 def parse_number(text: str) -> float:
-    """Vytáhne první smysluplné číslo z textu (cz/en formáty) a převede na float."""
+    """Extract the first meaningful number from text (cz/en formats) and convert it to float."""
     t = str(text)
     t = (t.replace("\u00A0", " ").replace("\u202F", " ").replace("\u2007", " ").strip())
     m = re.search(r"-?\d[\d.,\s]*\d", t)
     if not m:
-        raise ValueError(f"Nelze najít číslo v: {text!r}")
+        raise ValueError(f"Unable to find a number in: {text!r}")
     num = m.group(0)
     num = re.sub(r"[^\d.,\s-]", "", num).replace(" ", "")
     if "," in num and "." in num:
@@ -218,7 +218,7 @@ def parse_number(text: str) -> float:
         num = num.replace(",", ".")
     num = num.strip(".,")
     if not num or num in {"-", "."}:
-        raise ValueError(f"Nelze převést číslo z: {text!r}")
+        raise ValueError(f"Unable to parse a number from: {text!r}")
     return float(num)
 
 @dataclass
@@ -240,7 +240,7 @@ class Target:
 
 # ---- Playwright helpers ----
 class HeadlessBrowserManager:
-    """Správa sdíleného headless prohlížeče napříč měřeními."""
+    """Manage a shared headless browser across measurements."""
 
     def __init__(self) -> None:
         self._pw = None
@@ -332,7 +332,7 @@ async def capture_target(url: str) -> Tuple[str, float]:
 
         def on_close():
             if not fut.done():
-                fut.set_exception(RuntimeError("Výběr byl zrušen (okno zavřeno)."))
+                fut.set_exception(RuntimeError("Selection was cancelled (window closed)."))
 
         page.on("close", on_close)
         browser.on("disconnected", on_close)
@@ -372,7 +372,7 @@ async def capture_text_snippet(url: str) -> Tuple[str, str]:
 
         def on_close():
             if not fut.done():
-                fut.set_exception(RuntimeError("Výběr byl zrušen (okno zavřeno)."))
+                fut.set_exception(RuntimeError("Selection was cancelled (window closed)."))
 
         page.on("close", on_close)
         browser.on("disconnected", on_close)
@@ -403,7 +403,7 @@ async def capture_text_snippet(url: str) -> Tuple[str, str]:
             pass
 
 async def _maybe_accept_cookies(page):
-    sel = "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('Přijmout vše'), button:has-text('Přijmout'), button:has-text('Souhlasím')"
+    sel = "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('P\\u0159ijmout v\\u0161e'), button:has-text('P\\u0159ijmout'), button:has-text('Souhlas\\u00edm')"
     try:
         loc = page.locator(sel)
         if await loc.count():
@@ -416,7 +416,7 @@ async def fetch_target_data(
     timeout_ms: int,
     browser_factory: Optional[BrowserFactory] = None
 ) -> Tuple[float, Dict[int, Optional[str]]]:
-    """Jedna navigace + polling v DOM + časný sken kandidátů a načtení bonus textů."""
+    """Single navigation + DOM polling + early candidate scan and loading of bonus texts."""
     import time as _time
 
     context = None
@@ -435,10 +435,10 @@ async def fetch_target_data(
             else:
                 context, page = result
         else:
-            raise TypeError("browser_factory musí být HeadlessBrowserManager nebo callable vracející (context, page)")
+            raise TypeError("browser_factory must be a HeadlessBrowserManager or a callable returning (context, page)")
 
         if context is None or page is None:
-            raise RuntimeError("browser_factory musí vracet (context, page)")
+            raise RuntimeError("browser_factory must return (context, page)")
 
         timeout = timeout_ms if timeout_ms is not None else TIMEOUT_MS
         try:
@@ -459,7 +459,7 @@ async def fetch_target_data(
         price_value: Optional[float] = None
 
         while (_time.monotonic() - start) * 1000 < timeout_ms:
-            # Počkej, až se v elementu objeví číslice
+            # Wait until digits appear inside the element
             try:
                 handle = await loc.element_handle()
                 if handle is not None:
@@ -471,7 +471,7 @@ async def fetch_target_data(
             except Exception:
                 pass
 
-            # Čtení textu (fallbacky)
+            # Read text (fallback chain)
             txt = ""
             try:
                 txt = (await loc.inner_text()).strip()
@@ -501,9 +501,9 @@ async def fetch_target_data(
                     price_value = parse_number(txt)
                     break
                 except Exception:
-                    pass  # ještě zkusíme kandidáty níže
+                    pass  # still try the candidate scan below
 
-            # Jednorázový sken kandidátů po ~1.2 s
+            # One-time candidate scan after ~1.2 s
             if price_value is None and not did_candidate_scan and (_time.monotonic() - start) > 1.2:
                 did_candidate_scan = True
                 try:
@@ -569,7 +569,7 @@ async def fetch_target_data(
             await page.wait_for_timeout(250)
 
         if price_value is None:
-            raise RuntimeError(f"Timeout bez nalezení čísla (ukázka: {last_text_sample[:80]!r})")
+            raise RuntimeError(f"Timed out without finding a number (sample: {last_text_sample[:80]!r})")
 
         async def _read_bonus(sel: str) -> Optional[str]:
             try:
@@ -621,14 +621,14 @@ def send_email(subject: str, html_body: str) -> None:
     try:
         port = int(port_raw)
     except ValueError as exc:
-        print(f"[EMAIL] Neplatný SMTP port '{port_raw}': {exc}")
+        print(f"[EMAIL] Invalid SMTP port '{port_raw}': {exc}")
         return
     user = os.getenv("SMTP_USER")
     pwd = os.getenv("SMTP_PASS")
     from_addr = os.getenv("SMTP_FROM", user or "")
     to_raw = os.getenv("SMTP_TO")
     if not (host and user and pwd and to_raw):
-        print("[EMAIL] SMTP není nastaven – přeskočeno.")
+        print("[EMAIL] SMTP is not configured – skipped.")
         return
     to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
 
@@ -645,9 +645,9 @@ def send_email(subject: str, html_body: str) -> None:
             s.login(user, pwd)
             s.sendmail(from_addr, to_list, msg.as_string())
     except (smtplib.SMTPException, OSError) as exc:
-        print(f"[EMAIL] Nepodařilo se odeslat e-mail: {exc}")
+        print(f"[EMAIL] Failed to send email: {exc}")
         return
-    print(f"[EMAIL] Odesláno na {to_list}")
+    print(f"[EMAIL] Sent to {to_list}")
 
 # ---- DB helpers ----
 def db_all_targets() -> List[Target]:
@@ -767,7 +767,7 @@ def db_get_daily_stats(target_id: int) -> List[Dict[str, Optional[float]]]:
 
 # ---- Sorting helpers ----
 class NumItem(QTableWidgetItem):
-    """Třídí číselně podle Qt.UserRole."""
+    """Sort numerically using Qt.UserRole."""
     def __lt__(self, other):
         try:
             return float(self.data(Qt.UserRole)) < float(other.data(Qt.UserRole))
@@ -811,13 +811,13 @@ class BonusCellWidget(QtWidgets.QWidget):
 class HistoryDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget], target: Target, stats: List[Dict[str, Optional[float]]]):
         super().__init__(parent)
-        self.setWindowTitle(f"Vývoj ceny – ID {target.id}")
+        self.setWindowTitle(f"Price trend – ID {target.id}")
         self.resize(720, 420)
 
         layout = QtWidgets.QVBoxLayout(self)
 
         if not stats:
-            label = QtWidgets.QLabel("Pro tento cíl zatím nejsou denní záznamy.")
+            label = QtWidgets.QLabel("There are no daily records for this target yet.")
             label.setAlignment(Qt.AlignCenter)
             layout.addWidget(label)
             buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
@@ -827,7 +827,7 @@ class HistoryDialog(QtWidgets.QDialog):
             return
 
         price_series = QLineSeries()
-        price_series.setName("Cena")
+        price_series.setName("Price")
         price_series.setColor(QtGui.QColor("#2b7cd3"))
         price_series.setPointsVisible(True)
         price_series.setUseOpenGL(False)
@@ -881,12 +881,12 @@ class HistoryDialog(QtWidgets.QDialog):
 
         axis_x = QDateTimeAxis()
         axis_x.setFormat("dd.MM")
-        axis_x.setTitleText("Datum")
+        axis_x.setTitleText("Date")
         chart.addAxis(axis_x, Qt.AlignBottom)
         price_series.attachAxis(axis_x)
 
         axis_y_price = QValueAxis()
-        axis_y_price.setTitleText("Cena")
+        axis_y_price.setTitleText("Price")
         chart.addAxis(axis_y_price, Qt.AlignLeft)
         price_series.attachAxis(axis_y_price)
 
@@ -916,7 +916,7 @@ class HistoryDialog(QtWidgets.QDialog):
         axis_y_bonus = QValueAxis()
         axis_y_bonus.setRange(-0.1, 1.1)
         axis_y_bonus.setLabelFormat("%d")
-        axis_y_bonus.setTitleText("Bonus (1 = ano)")
+        axis_y_bonus.setTitleText("Bonus (1 = yes)")
         axis_y_bonus.setTickCount(3)
 
         bonus_colors = {
@@ -982,22 +982,22 @@ class MainWindow(QMainWindow):
         top = QWidget()
         top_layout = QVBoxLayout(top)
 
-        # URL bar + Popis + Přidat
+        # URL bar + Description + Add
         bar = QHBoxLayout()
-        self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("URL… (Shift+Click pro výběr čísla)")
-        self.desc_edit = QLineEdit(); self.desc_edit.setPlaceholderText("Popis… (volitelně)")
-        btn_add = QPushButton("Přidat a označit…")
+        self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("URL… (Shift+Click to pick a number)")
+        self.desc_edit = QLineEdit(); self.desc_edit.setPlaceholderText("Description… (optional)")
+        btn_add = QPushButton("Add and capture…")
         bar.addWidget(QLabel("URL:")); bar.addWidget(self.url_edit, 4)
-        bar.addWidget(QLabel("Popis:")); bar.addWidget(self.desc_edit, 2)
+        bar.addWidget(QLabel("Description:")); bar.addWidget(self.desc_edit, 2)
         bar.addWidget(btn_add, 1)
         top_layout.addLayout(bar)
 
         # Table
         self.table = QTableWidget(0, 11)
-        self.table.setHorizontalHeaderLabels(["ID", "URL", "Popis", "Baseline", "Poslední", "Načteno", "Změna", "Bonus I", "Bonus II", "Aktivní", "Akce"])
+        self.table.setHorizontalHeaderLabels(["ID", "URL", "Description", "Baseline", "Last", "Fetched", "Change", "Bonus I", "Bonus II", "Active", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        # výběr zcela vypneme, aby se Akce nikdy nevymalovala
+        # Disable selection entirely so the Actions column never gets colored
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         self.table.setStyleSheet('QTableWidget::item:selected{ background: transparent; }')
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
@@ -1009,7 +1009,7 @@ class MainWindow(QMainWindow):
 
         # Bottom
         bottom = QHBoxLayout()
-        self.btn_refresh = QPushButton("Kontrola aktivních")
+        self.btn_refresh = QPushButton("Check active")
         bottom.addStretch(1)
         bottom.addWidget(self.btn_refresh)
         top_layout.addLayout(bottom)
@@ -1018,10 +1018,10 @@ class MainWindow(QMainWindow):
 
         # ---- Theme menu + auto-detect ----
         menubar = self.menuBar()
-        view_menu = menubar.addMenu("Vzhled")
-        self.actionThemeAuto = view_menu.addAction("Automaticky (systém)")
-        self.actionThemeLight = view_menu.addAction("Světlý")
-        self.actionThemeDark  = view_menu.addAction("Tmavý")
+        view_menu = menubar.addMenu("Appearance")
+        self.actionThemeAuto = view_menu.addAction("Automatic (system)")
+        self.actionThemeLight = view_menu.addAction("Light")
+        self.actionThemeDark  = view_menu.addAction("Dark")
         self.actionThemeAuto.setCheckable(True)
         self.actionThemeLight.setCheckable(True)
         self.actionThemeDark.setCheckable(True)
@@ -1162,7 +1162,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, self.COL_ID, id_item)
         # URL
         self.table.setItem(row, self.COL_URL, TextItem(t.url))
-        # Popis (editable)
+        # Description (editable)
         desc_item = TextItem(t.description or ""); desc_item.setFlags(desc_item.flags() | Qt.ItemIsEditable)
         self.table.setItem(row, self.COL_DESC, desc_item)
         # Baseline
@@ -1209,7 +1209,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, self.COL_ACTIVE, active_item)
         # Actions
         cont = QWidget(); h = QtWidgets.QHBoxLayout(cont); h.setContentsMargins(0,0,0,0)
-        btn_measure = QPushButton("Kontrola"); btn_delete = QPushButton("Smazat")
+        btn_measure = QPushButton("Check"); btn_delete = QPushButton("Delete")
         h.addWidget(btn_measure); h.addWidget(btn_delete)
         btn_measure.clicked.connect(lambda _=False, b=btn_measure, ti=t, r=row: asyncio.get_event_loop().create_task(self._measure_one_busy(b, ti, r)))
         btn_delete.clicked.connect(lambda _=False, tid=t.id: self.delete_target(tid))
@@ -1236,11 +1236,11 @@ class MainWindow(QMainWindow):
         button_tip = ""
         if has_selector:
             if is_marker:
-                tooltip = "Text je definován, ale nebyl nalezen."
-                button_tip = tooltip + " Kliknutím zrušíte hlídání."
+                tooltip = "Text is defined but was not found."
+                button_tip = tooltip + " Click to stop monitoring."
             else:
                 tooltip = cleaned
-                button_tip = "Kliknutím zrušíte hlídání."
+                button_tip = "Click to stop monitoring."
         item.setText(cleaned)
         item.setToolTip(button_tip or tooltip)
         widget = self._bonus_widget_for_item(item)
@@ -1324,7 +1324,7 @@ class MainWindow(QMainWindow):
         return int(self.table.item(row, self.COL_ID).text())
 
     def delete_target(self, target_id: int):
-        if QMessageBox.question(self, APP_NAME, f"Opravdu smazat záznam {target_id}?") == QMessageBox.Yes:
+        if QMessageBox.question(self, APP_NAME, f"Delete record {target_id}?") == QMessageBox.Yes:
             db_delete_target(target_id)
             self.reload_table()
 
@@ -1402,7 +1402,7 @@ class MainWindow(QMainWindow):
                 target.bonus2_text = stored_text
             self._configure_bonus_item(item, stored_text, True)
         except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Nepodařilo se načíst text: {e}")
+            QMessageBox.critical(self, APP_NAME, f"Failed to load text: {e}")
         finally:
             self.setEnabled(True)
 
@@ -1425,9 +1425,9 @@ class MainWindow(QMainWindow):
             new_id = db_insert_target(url, selector, baseline, description=desc)
             self.url_edit.clear(); self.desc_edit.clear()
             self.reload_table()
-            QMessageBox.information(self, APP_NAME, f"Uloženo (ID {new_id})\nBaseline: {baseline}")
+            QMessageBox.information(self, APP_NAME, f"Saved (ID {new_id})\nBaseline: {baseline}")
         except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Nepodařilo se přidat: {e}")
+            QMessageBox.critical(self, APP_NAME, f"Failed to add: {e}")
         finally:
             self.setEnabled(True)
 
@@ -1455,7 +1455,7 @@ class MainWindow(QMainWindow):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
         val, ok, details, bonus_results, _newly_filled = await measure_target(t, timeout, browser_factory=browser_factory)
         measurement_failed = (val != val)
-        has_issue = bool(details and str(details).lower().startswith("chyba"))
+        has_issue = bool(details and str(details).lower().startswith("error"))
         if measurement_failed:
             tooltip = details or ""
 
@@ -1468,7 +1468,7 @@ class MainWindow(QMainWindow):
             time_item.setToolTip(tooltip)
             self.table.setItem(row, self.COL_TIME, time_item)
 
-            error_text = "Chyba"
+            error_text = "Error"
             delta_item = NumItem(error_text)
             delta_item.setData(Qt.UserRole, float('nan'))
             delta_item.setToolTip(tooltip)
@@ -1530,7 +1530,7 @@ class MainWindow(QMainWindow):
             self._set_button_busy(self.btn_refresh, False)
 
     async def on_refresh(self):
-        # samotné enable/disable řídí busy wrapper
+        # Busy wrapper controls enable/disable
         active_items = []
         for row in range(self.table.rowCount()):
             tid = self.row_target_id(row)
@@ -1574,7 +1574,7 @@ async def measure_target(
         else:
             if last_exc is not None:
                 raise last_exc
-            raise RuntimeError("fetch_target_data selhalo bez výjimky")
+            raise RuntimeError("fetch_target_data failed without raising an exception")
 
         missing = []
         newly_filled: List[int] = []
@@ -1596,12 +1596,12 @@ async def measure_target(
 
         drop_message = None
         if val < t.baseline:
-            drop_message = f"Pokles z {t.baseline} na {val}"
+            drop_message = f"Drop from {t.baseline} to {val}"
 
         details_parts: List[str] = []
         if missing:
             bonus_names = {1: "Bonus I", 2: "Bonus II"}
-            details_parts.append("; ".join(f"{bonus_names[m]} text nenalezen" for m in missing))
+            details_parts.append("; ".join(f"{bonus_names[m]} text not found" for m in missing))
         if drop_message:
             details_parts.append(drop_message)
         details = "; ".join(details_parts) if details_parts else None
@@ -1623,13 +1623,13 @@ async def measure_target(
 
         return val, ok, details, bonus, newly_filled
     except Exception as e:
-        db_insert_check(t.id, -1.0, 0, f"Chyba: {e}")
-        return float('nan'), False, f"Chyba: {e}", None, []
+        db_insert_check(t.id, -1.0, 0, f"Error: {e}")
+        return float('nan'), False, f"Error: {e}", None, []
 
 async def run_batch(send_mail_on_drop: bool = True) -> int:
     targets = [t for t in db_all_targets() if t.active]
     if not targets:
-        print("[BATCH] Žádné aktivní cíle.")
+        print("[BATCH] No active targets.")
         return 0
 
     drops = []   # (t, val, details)
@@ -1640,12 +1640,12 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
         for idx, t in enumerate(targets):
             timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
             val, ok, details, bonus, newly_filled = await measure_target(t, timeout, browser_factory=browser_manager)
-            is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
+            is_error = (val != val) or (details is not None and str(details).lower().startswith("error"))
             status = "OK"
             if is_error:
-                status = "CHYBA"; errors.append((t, details))
+                status = "ERROR"; errors.append((t, details))
             elif not ok:
-                status = "POKLES"; drops.append((t, val, details))
+                status = "DROP"; drops.append((t, val, details))
             if newly_filled:
                 for idx in newly_filled:
                     bonus_hits.append((t, idx))
@@ -1655,7 +1655,7 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
                 for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
                     if getattr(t, f"bonus{idx}_selector"):
                         txt = bonus.get(idx)
-                        suffix = " (nové)" if idx in newly_filled else ""
+                        suffix = " (new)" if idx in newly_filled else ""
                         bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
             if bonus_lines:
                 print("  " + " | ".join(bonus_lines))
@@ -1665,27 +1665,27 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
 
     if send_mail_on_drop and (drops or errors or bonus_hits):
         rows_drops = ''.join([
-            f"<tr><td>POKLES</td><td>{d[0].id}</td><td>{(d[0].description or '')}</td><td>{d[0].url}</td><td>{d[0].baseline}</td><td>{d[1]}</td><td>{d[2] or ''}</td></tr>"
+            f"<tr><td>DROP</td><td>{d[0].id}</td><td>{(d[0].description or '')}</td><td>{d[0].url}</td><td>{d[0].baseline}</td><td>{d[1]}</td><td>{d[2] or ''}</td></tr>"
             for d in drops
         ])
         rows_errs = ''.join([
-            f"<tr><td>CHYBA</td><td>{e[0].id}</td><td>{(e[0].description or '')}</td><td>{e[0].url}</td><td colspan=2>-</td><td>{e[1] or ''}</td></tr>"
+            f"<tr><td>ERROR</td><td>{e[0].id}</td><td>{(e[0].description or '')}</td><td>{e[0].url}</td><td colspan=2>-</td><td>{e[1] or ''}</td></tr>"
             for e in errors
         ])
         rows_bonus = ''.join([
-            f"<tr><td>BONUS</td><td>{b[0].id}</td><td>{(b[0].description or '')}</td><td>{b[0].url}</td><td colspan=2>-</td><td>{'Bonus I' if b[1]==1 else 'Bonus II'} nově nalezen</td></tr>"
+            f"<tr><td>BONUS</td><td>{b[0].id}</td><td>{(b[0].description or '')}</td><td>{b[0].url}</td><td colspan=2>-</td><td>{'Bonus I' if b[1]==1 else 'Bonus II'} found (new)</td></tr>"
             for b in bonus_hits
         ])
         html = f"""
-        <h3>{APP_NAME}: report měření (batch)</h3>
-        <p><b>Poklesy:</b> {len(drops)} &nbsp;|&nbsp; <b>Chyby:</b> {len(errors)} &nbsp;|&nbsp; <b>Bonus nové:</b> {len(bonus_hits)}</p>
+        <h3>{APP_NAME}: measurement report (batch)</h3>
+        <p><b>Drops:</b> {len(drops)} &nbsp;|&nbsp; <b>Errors:</b> {len(errors)} &nbsp;|&nbsp; <b>New bonus hits:</b> {len(bonus_hits)}</p>
         <table border=1 cellspacing=0 cellpadding=6>
-          <tr><th>Typ</th><th>ID</th><th>Popis</th><th>URL</th><th>Baseline</th><th>Observed</th><th>Detail</th></tr>
+          <tr><th>Type</th><th>ID</th><th>Description</th><th>URL</th><th>Baseline</th><th>Observed</th><th>Detail</th></tr>
           {rows_drops}{rows_errs}{rows_bonus}
         </table>
         <p>{datetime.now(timezone.utc).isoformat()}</p>
         """
-        send_email(f"{APP_NAME} batch: {len(drops)} pokles(ů), {len(errors)} chyb(a)", html)
+        send_email(f"{APP_NAME} batch: {len(drops)} drop(s), {len(errors)} error(s)", html)
 
     return 1 if (drops or errors or bonus_hits) else 0
 
