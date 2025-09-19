@@ -872,6 +872,7 @@ class MainWindow(QMainWindow):
 
         # QSettings
         self.settings = QSettings(ORG_NAME, APP_NAME)
+        self.restore_window_geometry()
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
@@ -1010,7 +1011,33 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.save_column_widths()
+        self.save_window_geometry()
         super().closeEvent(event)
+
+    def save_window_geometry(self):
+        try:
+            self.settings.setValue("window_geometry", self.saveGeometry())
+        except Exception:
+            pass
+        try:
+            self.settings.setValue("window_maximized", self.isMaximized())
+        except Exception:
+            pass
+
+    def restore_window_geometry(self):
+        geometry = self.settings.value("window_geometry")
+        if isinstance(geometry, QtCore.QByteArray) and not geometry.isEmpty():
+            self.restoreGeometry(geometry)
+        elif isinstance(geometry, (bytes, bytearray)) and geometry:
+            self.restoreGeometry(QtCore.QByteArray(geometry))
+
+        maximized = self.settings.value("window_maximized")
+        if isinstance(maximized, str):
+            maximized = maximized.lower() in {"1", "true", "yes", "y"}
+        else:
+            maximized = bool(maximized)
+        if maximized:
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
     # ---- Table ops ----
     def reload_table(self):
