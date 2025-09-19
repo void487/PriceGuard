@@ -24,6 +24,7 @@ Spuštění:
 """
 from __future__ import annotations
 import asyncio
+import inspect
 import math
 import random
 import os
@@ -35,7 +36,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Callable, Awaitable, Union, Any
 
 from dotenv import load_dotenv
 from PySide6 import QtCore, QtWidgets, QtGui
@@ -238,6 +239,76 @@ class Target:
     bonus2_text: Optional[str] = None
 
 # ---- Playwright helpers ----
+class HeadlessBrowserManager:
+    """Správa sdíleného headless prohlížeče napříč měřeními."""
+
+    def __init__(self) -> None:
+        self._pw = None
+        self._browser = None
+        self._lock = asyncio.Lock()
+
+    async def ensure_running(self) -> None:
+        if self._browser is not None:
+            return
+        async with self._lock:
+            if self._browser is not None:
+                return
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+
+    async def new_page(self, timeout_ms: Optional[int] = None):
+        await self.ensure_running()
+        context = await self._browser.new_context(
+            ignore_https_errors=True,
+            locale="cs-CZ",
+            timezone_id="Europe/Prague",
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 840},
+            extra_http_headers={"Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"}
+        )
+        page = await context.new_page()
+        timeout = timeout_ms if timeout_ms is not None else TIMEOUT_MS
+        page.set_default_timeout(timeout)
+        page.set_default_navigation_timeout(timeout)
+        return context, page
+
+    async def close(self) -> None:
+        async with self._lock:
+            browser, pw = self._browser, self._pw
+            self._browser = None
+            self._pw = None
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
+    async def restart(self) -> None:
+        await self.close()
+        await self.ensure_running()
+
+    async def __aenter__(self):
+        await self.ensure_running()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+
+
+BrowserFactory = Union[
+    HeadlessBrowserManager,
+    Callable[[], Union[Awaitable[Tuple[Any, Any]], Tuple[Any, Any]]]
+]
+
+
 async def launch_browser_headed():
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=False)
@@ -245,27 +316,14 @@ async def launch_browser_headed():
     page = await ctx.new_page()
     return pw, browser, page
 
-async def launch_browser_headless(pw=None):
-    close_pw = False
-    if pw is None:
-        pw = await async_playwright().start()
-        close_pw = True
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled"]
-    )
-    ctx = await browser.new_context(
-        ignore_https_errors=True,
-        locale="cs-CZ",
-        timezone_id="Europe/Prague",
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 840},
-        extra_http_headers={"Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"}
-    )
-    page = await ctx.new_page()
-    page.set_default_timeout(TIMEOUT_MS)
-    page.set_default_navigation_timeout(TIMEOUT_MS)
-    return pw, browser, page, close_pw
+async def launch_browser_headless(manager: Optional[HeadlessBrowserManager] = None, timeout_ms: Optional[int] = None):
+    owns_manager = False
+    if manager is None:
+        manager = HeadlessBrowserManager()
+        await manager.ensure_running()
+        owns_manager = True
+    context, page = await manager.new_page(timeout_ms=timeout_ms)
+    return manager, context, page, owns_manager
 
 async def capture_target(url: str) -> Tuple[str, float]:
     pw, browser, page = await launch_browser_headed()
@@ -353,11 +411,42 @@ async def _maybe_accept_cookies(page):
     except Exception:
         pass
 
-async def fetch_target_data(t: Target, timeout_ms: int) -> Tuple[float, Dict[int, Optional[str]]]:
+async def fetch_target_data(
+    t: Target,
+    timeout_ms: int,
+    browser_factory: Optional[BrowserFactory] = None
+) -> Tuple[float, Dict[int, Optional[str]]]:
     """Jedna navigace + polling v DOM + časný sken kandidátů a načtení bonus textů."""
     import time as _time
-    pw, browser, page, close_pw = await launch_browser_headless()
+
+    context = None
+    page = None
+    manager: Optional[HeadlessBrowserManager] = None
+    owns_manager = False
+
     try:
+        if browser_factory is None or isinstance(browser_factory, HeadlessBrowserManager):
+            manager_input = browser_factory if isinstance(browser_factory, HeadlessBrowserManager) else None
+            manager, context, page, owns_manager = await launch_browser_headless(manager_input, timeout_ms=timeout_ms)
+        elif callable(browser_factory):
+            result = browser_factory()
+            if inspect.isawaitable(result):
+                context, page = await result
+            else:
+                context, page = result
+        else:
+            raise TypeError("browser_factory musí být HeadlessBrowserManager nebo callable vracející (context, page)")
+
+        if context is None or page is None:
+            raise RuntimeError("browser_factory musí vracet (context, page)")
+
+        timeout = timeout_ms if timeout_ms is not None else TIMEOUT_MS
+        try:
+            page.set_default_timeout(timeout)
+            page.set_default_navigation_timeout(timeout)
+        except Exception:
+            pass
+
         await page.goto(t.url, wait_until="domcontentloaded", timeout=timeout_ms)
         await _maybe_accept_cookies(page)
 
@@ -513,9 +602,16 @@ async def fetch_target_data(t: Target, timeout_ms: int) -> Tuple[float, Dict[int
 
         return float(price_value), bonus
     finally:
-        await browser.close()
-        if close_pw:
-            await pw.stop()
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if owns_manager and manager is not None:
+            try:
+                await manager.close()
+            except Exception:
+                pass
 
 # ---- Email ----
 def send_email(subject: str, html_body: str) -> None:
@@ -1313,7 +1409,8 @@ class MainWindow(QMainWindow):
     async def _measure_one_busy(self, btn: QtWidgets.QPushButton, t: Target, row: int):
         self._set_button_busy(btn, True)
         try:
-            await self.measure_one(t, row)
+            async with HeadlessBrowserManager() as browser_manager:
+                await self.measure_one(t, row, browser_manager)
         finally:
             self._set_button_busy(btn, False)
 
@@ -1354,9 +1451,9 @@ class MainWindow(QMainWindow):
             btn.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
 
-    async def measure_one(self, t: Target, row: int):
+    async def measure_one(self, t: Target, row: int, browser_factory: Optional[BrowserFactory] = None):
         timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details, bonus_results, _newly_filled = await measure_target(t, timeout)
+        val, ok, details, bonus_results, _newly_filled = await measure_target(t, timeout, browser_factory=browser_factory)
         measurement_failed = (val != val)
         has_issue = bool(details and str(details).lower().startswith("chyba"))
         if measurement_failed:
@@ -1442,15 +1539,43 @@ class MainWindow(QMainWindow):
                 continue
             active_items.append((row, t))
 
-        for idx, (row, t) in enumerate(active_items):
-            await self.measure_one(t, row)
-            if idx < len(active_items) - 1:
-                await asyncio.sleep(random.uniform(5, 10))
+        if not active_items:
+            return
+
+        async with HeadlessBrowserManager() as browser_manager:
+            for idx, (row, t) in enumerate(active_items):
+                await self.measure_one(t, row, browser_manager)
+                if idx < len(active_items) - 1:
+                    await asyncio.sleep(random.uniform(5, 10))
 
 # ---- Batch ----
-async def measure_target(t: Target, timeout_ms: int) -> Tuple[float, bool, Optional[str], Optional[Dict[int, Optional[str]]], List[int]]:
+async def measure_target(
+    t: Target,
+    timeout_ms: int,
+    browser_factory: Optional[BrowserFactory] = None
+) -> Tuple[float, bool, Optional[str], Optional[Dict[int, Optional[str]]], List[int]]:
     try:
-        val, bonus = await fetch_target_data(t, timeout_ms)
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                val, bonus = await fetch_target_data(t, timeout_ms, browser_factory=browser_factory)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 1:
+                    restart = getattr(browser_factory, "restart", None) if browser_factory else None
+                    if restart is not None:
+                        try:
+                            await restart()
+                        except Exception:
+                            pass
+                    continue
+                raise
+        else:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("fetch_target_data selhalo bez výjimky")
+
         missing = []
         newly_filled: List[int] = []
         previous_bonus = {
@@ -1511,31 +1636,32 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
     errors = []  # (t, details)
     bonus_hits = []  # (t, idx)
 
-    for idx, t in enumerate(targets):
-        timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
-        val, ok, details, bonus, newly_filled = await measure_target(t, timeout)
-        is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
-        status = "OK"
-        if is_error:
-            status = "CHYBA"; errors.append((t, details))
-        elif not ok:
-            status = "POKLES"; drops.append((t, val, details))
-        if newly_filled:
-            for idx in newly_filled:
-                bonus_hits.append((t, idx))
-        print(f"[{status}] id={t.id} {t.url}\n  baseline={t.baseline} observed={val} details={details or '-'}")
-        bonus_lines = []
-        if isinstance(bonus, dict):
-            for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
-                if getattr(t, f"bonus{idx}_selector"):
-                    txt = bonus.get(idx)
-                    suffix = " (nové)" if idx in newly_filled else ""
-                    bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
-        if bonus_lines:
-            print("  " + " | ".join(bonus_lines))
+    async with HeadlessBrowserManager() as browser_manager:
+        for idx, t in enumerate(targets):
+            timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
+            val, ok, details, bonus, newly_filled = await measure_target(t, timeout, browser_factory=browser_manager)
+            is_error = (val != val) or (details is not None and str(details).lower().startswith("chyba"))
+            status = "OK"
+            if is_error:
+                status = "CHYBA"; errors.append((t, details))
+            elif not ok:
+                status = "POKLES"; drops.append((t, val, details))
+            if newly_filled:
+                for idx in newly_filled:
+                    bonus_hits.append((t, idx))
+            print(f"[{status}] id={t.id} {t.url}\n  baseline={t.baseline} observed={val} details={details or '-'}")
+            bonus_lines = []
+            if isinstance(bonus, dict):
+                for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
+                    if getattr(t, f"bonus{idx}_selector"):
+                        txt = bonus.get(idx)
+                        suffix = " (nové)" if idx in newly_filled else ""
+                        bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
+            if bonus_lines:
+                print("  " + " | ".join(bonus_lines))
 
-        if idx < len(targets) - 1:
-            await asyncio.sleep(random.uniform(5, 10))
+            if idx < len(targets) - 1:
+                await asyncio.sleep(random.uniform(5, 10))
 
     if send_mail_on_drop and (drops or errors or bonus_hits):
         rows_drops = ''.join([
