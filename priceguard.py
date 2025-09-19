@@ -1006,6 +1006,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.table)
 
         self._skip_bonus_click = False
+        self._active_message_boxes: List[QMessageBox] = []
 
         # Bottom
         bottom = QHBoxLayout()
@@ -1328,6 +1329,30 @@ class MainWindow(QMainWindow):
             db_delete_target(target_id)
             self.reload_table()
 
+    def _show_message_box(self, text: str, icon: QMessageBox.Icon) -> None:
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setIcon(icon)
+        box.setWindowTitle(APP_NAME)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.Ok)
+        self._active_message_boxes.append(box)
+
+        def _cleanup():
+            try:
+                self._active_message_boxes.remove(box)
+            except ValueError:
+                pass
+
+        box.finished.connect(_cleanup)
+        box.open()
+
+    def _show_error(self, text: str) -> None:
+        self._show_message_box(text, QMessageBox.Critical)
+
+    def _show_info(self, text: str) -> None:
+        self._show_message_box(text, QMessageBox.Information)
+
     def on_item_changed(self, item: QTableWidgetItem):
         row = item.row()
         tid = self.row_target_id(row)
@@ -1402,7 +1427,7 @@ class MainWindow(QMainWindow):
                 target.bonus2_text = stored_text
             self._configure_bonus_item(item, stored_text, True)
         except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Failed to load text: {e}")
+            self._show_error(f"Failed to load text: {e}")
         finally:
             self.setEnabled(True)
 
@@ -1425,9 +1450,9 @@ class MainWindow(QMainWindow):
             new_id = db_insert_target(url, selector, baseline, description=desc)
             self.url_edit.clear(); self.desc_edit.clear()
             self.reload_table()
-            QMessageBox.information(self, APP_NAME, f"Saved (ID {new_id})\nBaseline: {baseline}")
+            self._show_info(f"Saved (ID {new_id})\nBaseline: {baseline}")
         except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Failed to add: {e}")
+            self._show_error(f"Failed to add: {e}")
         finally:
             self.setEnabled(True)
 
