@@ -521,7 +521,12 @@ async def fetch_target_data(t: Target, timeout_ms: int) -> Tuple[float, Dict[int
 def send_email(subject: str, html_body: str) -> None:
     load_dotenv(override=False)
     host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
+    port_raw = os.getenv("SMTP_PORT", "587")
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        print(f"[EMAIL] Neplatný SMTP port '{port_raw}': {exc}")
+        return
     user = os.getenv("SMTP_USER")
     pwd = os.getenv("SMTP_PASS")
     from_addr = os.getenv("SMTP_FROM", user or "")
@@ -538,10 +543,14 @@ def send_email(subject: str, html_body: str) -> None:
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     import smtplib
-    with smtplib.SMTP(host, port) as s:
-        s.starttls()
-        s.login(user, pwd)
-        s.sendmail(from_addr, to_list, msg.as_string())
+    try:
+        with smtplib.SMTP(host, port) as s:
+            s.starttls()
+            s.login(user, pwd)
+            s.sendmail(from_addr, to_list, msg.as_string())
+    except (smtplib.SMTPException, OSError) as exc:
+        print(f"[EMAIL] Nepodařilo se odeslat e-mail: {exc}")
+        return
     print(f"[EMAIL] Odesláno na {to_list}")
 
 # ---- DB helpers ----
