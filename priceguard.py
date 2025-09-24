@@ -26,11 +26,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-import random
 import os
 import re
 import sqlite3
 import sys
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -61,6 +61,41 @@ APP_NAME = "PriceGuard"
 ORG_NAME = "PriceGuard"
 DB_PATH = "targets.db"
 TIMEOUT_MS = 60000  # ms
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+]
+
+
+class UserAgentRotator:
+    """Return user agents in a random, non-repeating order until the pool is exhausted."""
+
+    def __init__(self, agents: List[str]):
+        self._agents = list(agents)
+        if not self._agents:
+            raise ValueError("At least one user agent must be provided")
+        self._pool: List[str] = []
+        self._lock: Optional[asyncio.Lock] = None
+
+    async def next(self) -> str:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if not self._pool:
+                self._pool = random.sample(self._agents, len(self._agents))
+            return self._pool.pop()
+
+
+_user_agent_rotator = UserAgentRotator(USER_AGENTS)
 
 CREATE_SQL = """
 PRAGMA journal_mode=WAL;
@@ -261,11 +296,12 @@ class HeadlessBrowserManager:
 
     async def new_page(self, timeout_ms: Optional[int] = None):
         await self.ensure_running()
+        user_agent = await _user_agent_rotator.next()
         context = await self._browser.new_context(
             ignore_https_errors=True,
             locale="cs-CZ",
             timezone_id="Europe/Prague",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=user_agent,
             viewport={"width": 1280, "height": 840},
             extra_http_headers={"Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8"}
         )
