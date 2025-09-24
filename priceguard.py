@@ -1698,7 +1698,7 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
     bonus_hits = []  # (t, idx)
 
     async with HeadlessBrowserManager() as browser_manager:
-        for idx, t in enumerate(targets):
+        for target_index, t in enumerate(targets):
             timeout = t.timeout_ms if t.timeout_ms else TIMEOUT_MS
             val, ok, details, bonus, newly_filled = await measure_target(t, timeout, browser_factory=browser_manager)
             is_error = (val != val) or (details is not None and str(details).lower().startswith("error"))
@@ -1708,20 +1708,20 @@ async def run_batch(send_mail_on_drop: bool = True) -> int:
             elif not ok:
                 status = "DROP"; drops.append((t, val, details))
             if newly_filled:
-                for idx in newly_filled:
-                    bonus_hits.append((t, idx))
+                for bonus_idx in newly_filled:
+                    bonus_hits.append((t, bonus_idx))
             print(f"[{status}] id={t.id} {t.url}\n  baseline={t.baseline} observed={val} details={details or '-'}")
             bonus_lines = []
             if isinstance(bonus, dict):
-                for idx, label in ((1, "Bonus I"), (2, "Bonus II")):
-                    if getattr(t, f"bonus{idx}_selector"):
-                        txt = bonus.get(idx)
-                        suffix = " (new)" if idx in newly_filled else ""
+                for bonus_idx, label in ((1, "Bonus I"), (2, "Bonus II")):
+                    if getattr(t, f"bonus{bonus_idx}_selector"):
+                        txt = bonus.get(bonus_idx)
+                        suffix = " (new)" if bonus_idx in newly_filled else ""
                         bonus_lines.append(f"{label}={'-' if not txt else txt}{suffix}")
             if bonus_lines:
                 print("  " + " | ".join(bonus_lines))
 
-            if idx < len(targets) - 1:
+            if target_index < len(targets) - 1:
                 await asyncio.sleep(random.uniform(5, 10))
 
     if send_mail_on_drop and (drops or errors or bonus_hits):
