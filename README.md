@@ -84,3 +84,20 @@ Clicking on **Bonus I** or **Bonus II** opens a browser window where you can Shi
 * If a page changes structure, re-capture the price or bonus selector via Shift+Click. The application keeps previously stored history intact.
 * When running on a server, make sure the environment has access to the display if you want to use the GUI. Batch mode works headlessly.
 
+### Diagnosing "sources only" answers in web-enabled assistants
+
+If your assistant prints only a **Sources** list and no final sentence, the most common causes are orchestration issues (stream cancellation, duplicate requests, or response assembly bugs), not failed crawling itself.
+
+What to check in logs:
+
+* **Web stage completed** – entries such as `staged_web_search status=finished` and `rerank status=finished returned=...` mean retrieval worked.
+* **Firecrawl enrichment completed** – `staged_firecrawl_enrichment status=finished` means enrichment did not crash.
+* **Stream interruption** – `stream_upstream status=cancelled` often indicates the first generation stream was interrupted and replaced. In that case, the final answer may contain only partially assembled output (for example, sources without synthesis text).
+
+Practical mitigation:
+
+1. Prevent duplicate in-flight requests for the same conversation/query.
+2. Ensure source rendering happens **after** text synthesis is finalized, not before.
+3. Add a guard in the response builder: if body text is empty but citations exist, regenerate a short answer from top-ranked sources before returning.
+
+For a concrete implementation pattern, see `response_guard.py` (`ensure_body_text`) and its unit tests in `tests/test_response_guard.py`.
