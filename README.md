@@ -98,6 +98,5 @@ Practical mitigation:
 
 1. Prevent duplicate in-flight requests for the same conversation/query.
 2. Ensure source rendering happens **after** text synthesis is finalized, not before.
-3. Add a guard in the response builder: if body text is empty but citations exist, regenerate a short answer from top-ranked sources before returning.
-
-For a concrete implementation pattern, see `response_guard.py` (`ensure_body_text`) and its unit tests in `tests/test_response_guard.py`.
+3. Harden query rewriting (strip wrappers such as `User message: ...`, preserve key entities, and fallback to original user query when overlap drops too low).
+4. Treat empty body text as an upstream failure to fix, not as something to regenerate in the response layer.
