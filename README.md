@@ -100,3 +100,7 @@ Practical mitigation:
 2. Ensure source rendering happens **after** text synthesis is finalized, not before.
 3. Harden query rewriting (strip wrappers such as `User message: ...`, preserve key entities, and fallback to original user query when overlap drops too low).
 4. Treat empty body text as an upstream failure to fix, not as something to regenerate in the response layer.
+5. Add a query-finalization guard before web search:
+   * strip wrappers like `User message: "..."`,
+   * keep quoted payload when present,
+   * compute entity/token overlap with the original user prompt and fallback to original if overlap is too low.
